@@ -1,0 +1,35 @@
+big:
+  window_minutes: 60
+  k_multiplier: 15
+  aggregate_ms: 1500
+
+cd:
+  alert_window_sec: 300
+  alert_pct: 5
+  cooldown_sec: 600
+
+rsi:
+  period: 14
+  timeframes: [1h, 4h, 1d]
+  swing_lookback: 8
+  min_swing_distance: 3
+
+report:
+  timeframes: [15m, 1h, 4h, 1d, 1w]
+
+bucket:
+  seconds: 60
+
+flush_interval_sec: 2
+
+exchanges:
+  enabled:
+    - binance
+    - bybit
+    - bitget
+    - okx
+    - htx
+    - kucoin
+    - mexc
+    - gate
+    - bingx

@@ -1,0 +1,1 @@
+"""Spot Parser application package."""
