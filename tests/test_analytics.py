@@ -21,6 +21,8 @@ def test_parse_add_args():
     assert coin == "BTC" and ex == "binance" and big and cd and thr is None
     coin, ex, big, cd, thr = parse_add_args("/add SOL bybit big:50000")
     assert big and thr == 50000 and not cd
+    coin, ex, big, cd, thr = parse_add_args("ETH okx")
+    assert coin == "ETH" and ex == "okx" and not big and not cd
 
 
 def test_compute_rsi_length():

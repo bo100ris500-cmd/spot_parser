@@ -58,6 +58,13 @@ class BigTradeDetector:
             self._pending.pop((pair_id, "buy"), None)
             self._pending.pop((pair_id, "sell"), None)
 
+    def clear_pair(self, pair_id: int) -> None:
+        self._meta.pop(pair_id, None)
+        self._samples.pop(pair_id, None)
+        self._seen_ids.pop(pair_id, None)
+        self._pending.pop((pair_id, "buy"), None)
+        self._pending.pop((pair_id, "sell"), None)
+
     async def on_trade(self, pair_id: int, trade: NormalizedTrade) -> None:
         meta = self._meta.get(pair_id)
         if not meta or not meta.get("enabled"):

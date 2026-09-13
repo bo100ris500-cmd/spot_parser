@@ -38,6 +38,8 @@ class WatchedPair(Base):
     timestamp_added: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow
     )
+    big_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cd_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -45,9 +47,26 @@ class WatchedPair(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=utcnow
     )
 
-    delta_state: Mapped[DeltaState | None] = relationship(back_populates="pair", uselist=False)
-    candles: Mapped[list[OhlcCandle]] = relationship(back_populates="pair")
-    buckets: Mapped[list[DeltaBucket]] = relationship(back_populates="pair")
+    delta_state: Mapped[DeltaState | None] = relationship(
+        back_populates="pair",
+        uselist=False,
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    candles: Mapped[list[OhlcCandle]] = relationship(
+        back_populates="pair",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    buckets: Mapped[list[DeltaBucket]] = relationship(
+        back_populates="pair",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    sent_alerts: Mapped[list[SentAlert]] = relationship(
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
 
 class OhlcCandle(Base):

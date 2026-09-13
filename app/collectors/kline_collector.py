@@ -21,6 +21,8 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 TF_SECONDS = {
+    "1m": 60,
+    "5m": 5 * 60,
     "15m": 15 * 60,
     "1h": 60 * 60,
     "4h": 4 * 60 * 60,
@@ -77,13 +79,17 @@ class KlineCollector:
 
         report_tfs = list(self.config.get("report", "timeframes", default=["15m", "1h", "4h", "1d", "1w"]))
         rsi_tfs = list(self.config.get("rsi", "timeframes", default=["1h", "4h", "1d"]))
+        chart_tfs = list(self.config.get("cd_chart", "timeframes", default=["1m", "5m", "15m", "1h", "4h", "1d"]))
         all_tfs = sorted(set(report_tfs) | set(rsi_tfs), key=lambda x: TF_SECONDS.get(x, 0))
 
         for pair in pairs:
             adapter = self.hub.get_adapter(pair.exchange)
             if adapter is None:
                 continue
-            for tf in all_tfs:
+            tfs = list(all_tfs)
+            if pair.flag_cd:
+                tfs = sorted(set(tfs) | set(chart_tfs), key=lambda x: TF_SECONDS.get(x, 0))
+            for tf in tfs:
                 try:
                     await self._sync_pair_tf(adapter, pair, tf, check_rsi=tf in rsi_tfs)
                 except Exception as exc:

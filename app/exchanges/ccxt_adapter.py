@@ -6,6 +6,7 @@ from typing import Any, AsyncIterator
 import ccxt.pro as ccxtpro
 
 from app.exchanges.base import NormalizedCandle, NormalizedTrade, Side
+from app.exchanges.names import quotes_for
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -21,6 +22,9 @@ CCXT_IDS: dict[str, str] = {
     "mexc": "mexc",
     "gate": "gate",
     "bingx": "bingx",
+    "hyperliquid": "hyperliquid",
+    "coinbase": "coinbase",
+    "lbank": "lbank",
 }
 
 
@@ -60,7 +64,11 @@ class CcxtExchangeAdapter:
         self.name = name
         ccxt_id = CCXT_IDS[name]
         exchange_cls = getattr(ccxtpro, ccxt_id)
-        self._exchange = exchange_cls({"enableRateLimit": True, "options": {"defaultType": "spot"}})
+        options: dict[str, Any] = {"defaultType": "spot"}
+        if name == "hyperliquid":
+            # Prefer spot; Hyperliquid also has swap markets
+            options["defaultType"] = "spot"
+        self._exchange = exchange_cls({"enableRateLimit": True, "options": options})
         self._markets_loaded = False
 
     async def load_markets(self) -> None:
@@ -74,19 +82,31 @@ class CcxtExchangeAdapter:
         coin = coin.upper().strip()
         if "/" in coin:
             return coin
-        return f"{coin}/USDT"
+        quote = quotes_for(self.name)[0]
+        return f"{coin}/{quote}"
 
     def resolve_symbol(self, coin: str) -> str | None:
-        symbol = self.normalize_symbol(coin)
+        coin = coin.upper().strip()
+        if "/" in coin:
+            base = coin
+            candidates = [coin]
+        else:
+            candidates = [f"{coin}/{q}" for q in quotes_for(self.name)]
         if not self._markets_loaded:
-            return symbol
+            return candidates[0]
         markets = self._exchange.markets or {}
-        if symbol in markets:
-            return symbol
-        # try alternate quote names used by some venues
-        for alt in (f"{coin.upper()}/USDT", f"{coin.upper()}/USD"):
-            if alt in markets:
-                return alt
+        for symbol in candidates:
+            m = markets.get(symbol)
+            if not m:
+                continue
+            # Prefer spot / non-swap when type is present
+            mtype = (m.get("type") or m.get("spot") and "spot") or ""
+            if m.get("spot") is True or mtype == "spot" or m.get("swap") is not True:
+                return symbol
+        # Fallback: any matching symbol even if type unclear
+        for symbol in candidates:
+            if symbol in markets:
+                return symbol
         return None
 
     def _to_normalized_trade(self, trade: dict[str, Any], symbol: str) -> NormalizedTrade:
@@ -138,6 +158,37 @@ class CcxtExchangeAdapter:
                 )
             )
         return candles
+
+    async def fetch_quote_volume(self, symbol: str) -> float | None:
+        """Best-effort 24h quote volume in quote currency units."""
+        await self.load_markets()
+        try:
+            ticker = await self._exchange.fetch_ticker(symbol)
+        except Exception as exc:
+            logger.warning("fetch_ticker failed %s %s: %s", self.name, symbol, exc)
+            return None
+        for key in ("quoteVolume", "baseVolume"):
+            val = ticker.get(key)
+            if val is not None:
+                try:
+                    vol = float(val)
+                except (TypeError, ValueError):
+                    continue
+                if key == "baseVolume":
+                    last = ticker.get("last") or ticker.get("close")
+                    if last:
+                        vol = vol * float(last)
+                    else:
+                        continue
+                return vol
+        info = ticker.get("info") or {}
+        for key in ("quoteVolume", "volValue", "turnover24h", "volume24h", "volume_24h"):
+            if key in info and info[key] is not None:
+                try:
+                    return float(info[key])
+                except (TypeError, ValueError):
+                    continue
+        return None
 
     async def close(self) -> None:
         try:

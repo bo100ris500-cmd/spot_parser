@@ -17,6 +17,9 @@ rsi:
 report:
   timeframes: [15m, 1h, 4h, 1d, 1w]
 
+cd_chart:
+  timeframes: [1m, 5m, 15m, 1h, 4h, 1d]
+
 bucket:
   seconds: 60
 
@@ -33,3 +36,6 @@ exchanges:
     - mexc
     - gate
     - bingx
+    - hyperliquid
+    - coinbase
+    - lbank

@@ -48,8 +48,21 @@ class CumDeltaEngine:
             "coin": coin,
             "alerts_enabled": alerts_enabled,
         }
-        if pair_id not in self._state:
+        rt = self._state.get(pair_id)
+        if rt is None:
             self._state[pair_id] = PairDeltaRuntime(cum_delta=cum_delta)
+        else:
+            # Keep in-memory value unless caller explicitly resets via reset_pair
+            pass
+
+    def reset_pair(self, pair_id: int, cum_delta: float = 0.0) -> None:
+        self._state[pair_id] = PairDeltaRuntime(cum_delta=cum_delta)
+        self._buckets.pop(pair_id, None)
+
+    def clear_pair(self, pair_id: int) -> None:
+        self._meta.pop(pair_id, None)
+        self._state.pop(pair_id, None)
+        self._buckets.pop(pair_id, None)
 
     def get_cum_delta(self, pair_id: int) -> float:
         rt = self._state.get(pair_id)
@@ -85,11 +98,13 @@ class CumDeltaEngine:
 
     async def on_trade(self, pair_id: int, trade: NormalizedTrade) -> None:
         meta = self._meta.get(pair_id)
-        if not meta:
+        # Accumulate only while cumulative-delta tracking is enabled for the pair.
+        if not meta or not meta.get("alerts_enabled"):
             return
 
-        # Always accumulate for reports while pair is watched; spike alerts only if enabled (cd)
         rt = self._state.setdefault(pair_id, PairDeltaRuntime())
+        # Prefer trade timestamp for bucket alignment; fall back to wall clock.
+        trade_ts = trade.timestamp.timestamp() if trade.timestamp else time.time()
         signed = trade.amount if trade.side == "buy" else -trade.amount
         rt.cum_delta += signed
         rt.dirty = True
@@ -103,7 +118,7 @@ class CumDeltaEngine:
             rt.events.popleft()
 
         bucket_sec = int(self.config.get("bucket", "seconds", default=60))
-        start = int(now // bucket_sec) * bucket_sec
+        start = int(trade_ts // bucket_sec) * bucket_sec
         acc = self._buckets[pair_id].setdefault(
             start, {"buy_vol": 0.0, "sell_vol": 0.0, "trade_count": 0.0, "notional_sum": 0.0}
         )
@@ -114,8 +129,7 @@ class CumDeltaEngine:
         acc["trade_count"] += 1
         acc["notional_sum"] += trade.cost
 
-        if meta.get("alerts_enabled"):
-            await self._maybe_alert(pair_id, rt, now)
+        await self._maybe_alert(pair_id, rt, now)
 
     async def _maybe_alert(self, pair_id: int, rt: PairDeltaRuntime, now: float) -> None:
         window = float(self.config.get("cd", "alert_window_sec", default=300))

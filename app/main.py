@@ -4,6 +4,8 @@ import asyncio
 
 from aiogram import Bot
 
+from sqlalchemy import text
+
 from app.bot.handlers import create_dispatcher, send_alert, set_hub, setup_bot_commands
 from app.config import get_app_config, get_settings
 from app.db.models import Base
@@ -20,6 +22,13 @@ async def init_db() -> None:
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Safety for existing DBs if alembic was skipped
+        await conn.execute(
+            text("ALTER TABLE watched_pairs ADD COLUMN IF NOT EXISTS big_started_at TIMESTAMPTZ")
+        )
+        await conn.execute(
+            text("ALTER TABLE watched_pairs ADD COLUMN IF NOT EXISTS cd_started_at TIMESTAMPTZ")
+        )
     get_session_factory()
     logger.info("Database schema ensured")
 
