@@ -4,7 +4,7 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from app.config import AppConfig
 from app.exchanges.base import NormalizedTrade
@@ -26,11 +26,25 @@ class _AggPending:
 
 
 class BigTradeDetector:
-    """Adaptive / absolute big trade detector with short-window aggregation."""
+    """
+    Big-trade detector for all watched exchanges.
 
-    def __init__(self, config: AppConfig, publisher: AlertPublisher) -> None:
+    Threshold is taken from the most liquid watched exchange for the coin
+    (adaptive avg×K or absolute big:USD on that venue), then applied to
+    trades on every exchange — so alerts fire on all venues, but with one
+    shared liquidity-based bar.
+    """
+
+    def __init__(
+        self,
+        config: AppConfig,
+        publisher: AlertPublisher,
+        *,
+        most_liquid_exchange: Callable[[str], Awaitable[str | None]] | None = None,
+    ) -> None:
         self.config = config
         self.publisher = publisher
+        self._most_liquid_exchange = most_liquid_exchange
         # pair_id -> deque of (ts, usd_volume)
         self._samples: dict[int, deque[tuple[float, float]]] = defaultdict(deque)
         self._seen_ids: dict[int, set[str]] = defaultdict(set)
@@ -65,40 +79,83 @@ class BigTradeDetector:
         self._pending.pop((pair_id, "buy"), None)
         self._pending.pop((pair_id, "sell"), None)
 
+    def _ref_pair_id(self, coin: str, preferred_exchange: str | None) -> int | None:
+        candidates = [
+            pid
+            for pid, m in self._meta.items()
+            if m.get("enabled") and m.get("coin") == coin
+        ]
+        if not candidates:
+            return None
+        if preferred_exchange:
+            for pid in candidates:
+                if self._meta[pid]["exchange"] == preferred_exchange:
+                    return pid
+        return candidates[0]
+
+    async def _shared_threshold(self, coin: str, fallback_cost: float) -> float:
+        """Threshold from most liquid big-watched exchange for this coin."""
+        window_min = float(self.config.get("big", "window_minutes", default=60))
+        k = float(self.config.get("big", "k_multiplier", default=15))
+
+        preferred: str | None = None
+        use_liq = bool(self.config.get("big", "threshold_from_most_liquid", default=True))
+        if use_liq and self._most_liquid_exchange is not None:
+            try:
+                preferred = await self._most_liquid_exchange(coin)
+            except Exception as exc:
+                logger.warning("most-liquid lookup failed for %s: %s", coin, exc)
+
+        ref_pid = self._ref_pair_id(coin, preferred)
+        if ref_pid is None:
+            return max(fallback_cost * k, 1000.0)
+
+        meta = self._meta[ref_pid]
+        absolute = meta.get("threshold_usd")
+        if absolute is not None:
+            return float(absolute)
+
+        now = time.time()
+        samples = self._samples[ref_pid]
+        cutoff = now - window_min * 60
+        while samples and samples[0][0] < cutoff:
+            samples.popleft()
+
+        if len(samples) < 10:
+            # Warm-up on reference venue: keep a sane floor
+            if samples:
+                avg = sum(v for _, v in samples) / len(samples)
+            else:
+                avg = fallback_cost
+            return max(avg * k, 1000.0)
+
+        avg = sum(v for _, v in samples) / len(samples)
+        return avg * k
+
     async def on_trade(self, pair_id: int, trade: NormalizedTrade) -> None:
         meta = self._meta.get(pair_id)
         if not meta or not meta.get("enabled"):
             return
 
-        # dedup by trade id
         seen = self._seen_ids[pair_id]
         if trade.trade_id in seen:
             return
         seen.add(trade.trade_id)
         if len(seen) > 5000:
-            # crude trim
             self._seen_ids[pair_id] = set(list(seen)[-2500:])
 
         now = time.time()
-        window_min = float(self.config.get("big", "window_minutes", default=60))
-        k = float(self.config.get("big", "k_multiplier", default=15))
         agg_ms = float(self.config.get("big", "aggregate_ms", default=1500))
+        window_min = float(self.config.get("big", "window_minutes", default=60))
 
+        # Always record samples on this venue (reference venue needs its own history)
         samples = self._samples[pair_id]
         samples.append((now, trade.cost))
         cutoff = now - window_min * 60
         while samples and samples[0][0] < cutoff:
             samples.popleft()
 
-        threshold = meta.get("threshold_usd")
-        if threshold is None:
-            if len(samples) < 10:
-                avg = trade.cost  # warm-up: compare against itself * K effectively skips early spam
-                # during warm-up require absolute minimum of $5k equivalent adaptive
-                threshold = max(avg * k, 1000.0)
-            else:
-                avg = sum(v for _, v in samples) / len(samples)
-                threshold = avg * k
+        threshold = await self._shared_threshold(meta["coin"], trade.cost)
 
         if trade.cost < threshold:
             await self._flush_expired(pair_id, now, agg_ms)

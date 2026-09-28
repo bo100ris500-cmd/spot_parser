@@ -6,6 +6,7 @@ from typing import Any, AsyncIterator
 import ccxt.pro as ccxtpro
 
 from app.exchanges.base import NormalizedCandle, NormalizedTrade, Side
+from app.exchanges.capabilities import supports_timeframe
 from app.exchanges.names import quotes_for
 from app.utils.logging import get_logger
 
@@ -35,25 +36,17 @@ def _ms_to_dt(ms: int | float | None) -> datetime:
 
 
 def normalize_side(trade: dict[str, Any]) -> Side:
-    """
-    Normalize taker side from ccxt unified trade.
-    ccxt usually provides trade['side'] as the taker side (buy/sell).
-    Fallback: side from info.isBuyerMaker (Binance-style).
-    """
     side = trade.get("side")
     if side in ("buy", "sell"):
         return side  # type: ignore[return-value]
 
     info = trade.get("info") or {}
-    # Binance spot: m / isBuyerMaker — True means buyer is maker => taker is sell
     if "m" in info:
         return "sell" if info["m"] else "buy"
     if "isBuyerMaker" in info:
         return "sell" if info["isBuyerMaker"] else "buy"
-    if "buyerIsMaker" in info:  # some Bybit payloads
+    if "buyerIsMaker" in info:
         return "sell" if info["buyerIsMaker"] else "buy"
-
-    # Last resort: treat as buy to avoid dropping the trade; log upstream if needed
     return "buy"
 
 
@@ -66,15 +59,14 @@ class CcxtExchangeAdapter:
         exchange_cls = getattr(ccxtpro, ccxt_id)
         options: dict[str, Any] = {"defaultType": "spot"}
         if name == "hyperliquid":
-            # Prefer spot; Hyperliquid also has swap markets
             options["defaultType"] = "spot"
         self._exchange = exchange_cls({"enableRateLimit": True, "options": options})
         self._markets_loaded = False
 
-    async def load_markets(self) -> None:
-        if self._markets_loaded:
+    async def load_markets(self, reload: bool = False) -> None:
+        if self._markets_loaded and not reload:
             return
-        await self._exchange.load_markets()
+        await self._exchange.load_markets(reload)
         self._markets_loaded = True
         logger.info("Loaded markets for %s (%s symbols)", self.name, len(self._exchange.markets))
 
@@ -86,9 +78,9 @@ class CcxtExchangeAdapter:
         return f"{coin}/{quote}"
 
     def resolve_symbol(self, coin: str) -> str | None:
+        """Return active spot symbol if present on the exchange."""
         coin = coin.upper().strip()
         if "/" in coin:
-            base = coin
             candidates = [coin]
         else:
             candidates = [f"{coin}/{q}" for q in quotes_for(self.name)]
@@ -99,15 +91,26 @@ class CcxtExchangeAdapter:
             m = markets.get(symbol)
             if not m:
                 continue
-            # Prefer spot / non-swap when type is present
-            mtype = (m.get("type") or m.get("spot") and "spot") or ""
-            if m.get("spot") is True or mtype == "spot" or m.get("swap") is not True:
+            if m.get("active") is False:
+                continue
+            if m.get("spot") is True:
                 return symbol
-        # Fallback: any matching symbol even if type unclear
-        for symbol in candidates:
-            if symbol in markets:
+            mtype = m.get("type")
+            if mtype == "spot":
+                return symbol
+            if m.get("swap") is not True and mtype not in ("swap", "future", "option"):
                 return symbol
         return None
+
+    def supports_timeframe(self, timeframe: str) -> bool:
+        if not supports_timeframe(self.name, timeframe):
+            return False
+        # Also respect ccxt timeframes map when available
+        tfs = getattr(self._exchange, "timeframes", None) or {}
+        if tfs and timeframe not in tfs:
+            # Coinbase etc. may use different keys; trust our capability table
+            return supports_timeframe(self.name, timeframe)
+        return True
 
     def _to_normalized_trade(self, trade: dict[str, Any], symbol: str) -> NormalizedTrade:
         price = float(trade["price"])
@@ -129,6 +132,10 @@ class CcxtExchangeAdapter:
 
     async def watch_trades(self, symbol: str) -> AsyncIterator[list[NormalizedTrade]]:
         await self.load_markets()
+        markets = self._exchange.markets or {}
+        m = markets.get(symbol)
+        if not m or m.get("active") is False:
+            raise ValueError(f"invalid symbol {symbol}")
         while True:
             trades = await self._exchange.watch_trades(symbol)
             normalized = [self._to_normalized_trade(t, symbol) for t in trades]
@@ -138,7 +145,8 @@ class CcxtExchangeAdapter:
         self, symbol: str, timeframe: str, since: int | None = None, limit: int = 200
     ) -> list[NormalizedCandle]:
         await self.load_markets()
-        # normalize timeframe aliases
+        if not self.supports_timeframe(timeframe):
+            return []
         tf = {"1D": "1d", "1W": "1w", "1d": "1d", "1w": "1w"}.get(timeframe, timeframe)
         rows = await self._exchange.fetch_ohlcv(symbol, timeframe=tf, since=since, limit=limit)
         candles: list[NormalizedCandle] = []
@@ -159,8 +167,19 @@ class CcxtExchangeAdapter:
             )
         return candles
 
+    async def fetch_trades_range(
+        self, symbol: str, since_ms: int, limit: int = 1000
+    ) -> list[NormalizedTrade]:
+        """Best-effort historical trades (not persisted)."""
+        await self.load_markets()
+        try:
+            rows = await self._exchange.fetch_trades(symbol, since=since_ms, limit=limit)
+        except Exception as exc:
+            logger.warning("fetch_trades failed %s %s: %s", self.name, symbol, exc)
+            return []
+        return [self._to_normalized_trade(t, symbol) for t in rows]
+
     async def fetch_quote_volume(self, symbol: str) -> float | None:
-        """Best-effort 24h quote volume in quote currency units."""
         await self.load_markets()
         try:
             ticker = await self._exchange.fetch_ticker(symbol)

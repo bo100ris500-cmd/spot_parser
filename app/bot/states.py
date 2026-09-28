@@ -23,3 +23,12 @@ class CdStates(StatesGroup):
     choosing_exchange = State()
     choosing_tf = State()
     waiting_interval = State()
+
+
+class OtchetStates(StatesGroup):
+    waiting_ticker = State()
+
+
+class CustomCdStates(StatesGroup):
+    waiting_ticker = State()
+    waiting_period = State()

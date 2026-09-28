@@ -14,7 +14,6 @@ from app.bot.formatters import (
     format_cd_alert,
     format_check_table,
     format_pair_list,
-    format_report,
     format_rsi_alert,
     parse_ticker_exchanges,
 )
@@ -27,13 +26,19 @@ from app.bot.keyboards import (
     skip_interval_keyboard,
     timeframes_keyboard,
 )
-from app.bot.states import AddStates, CdStates, CheckStates, RemoveStates
+from app.bot.states import AddStates, CdStates, CheckStates, CustomCdStates, OtchetStates, RemoveStates
 from app.exchanges.names import display_name, ordered_enabled
 from app.exchanges.registry import list_supported_exchanges
 from app.services.chart import build_cd_series, parse_interval_text, render_cd_chart_png
-from app.services.report import build_otchet
+from app.services.report import (
+    build_custom_cd_report,
+    build_otchet_v2,
+    format_custom_cd_mono,
+    format_otchet_mono,
+)
 from app.utils.errors import friendly_error
 from app.utils.logging import get_logger
+from app.utils.timefmt import format_dt, now_display
 
 if TYPE_CHECKING:
     from app.services.runtime import RuntimeHub
@@ -67,8 +72,19 @@ def _msg(callback: CallbackQuery) -> Message:
     return callback.message  # type: ignore[return-value]
 
 
+def _html_pre(text: str) -> str:
+    escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return f"<pre>{escaped}</pre>"
+
+
+async def _answer_mono(message: Message, text: str) -> None:
+    if len(text) > 3900:
+        text = text[:3900] + "\n…"
+    await message.answer(_html_pre(text), parse_mode="HTML")
+
+
 # ---------------------------------------------------------------------------
-# /start /list /otchet
+# /start /list /otchet /custom_cd
 # ---------------------------------------------------------------------------
 
 
@@ -81,12 +97,13 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     await message.answer(
         "Spot Parser бот готов.\n"
         "Команды:\n"
-        "/check — наличиеть тикер на биржах\n"
+        "/check — проверить тикер на биржах\n"
         "/add — добавить отслеживание\n"
         "/remove — удалить отслеживание\n"
         "/list — список пар\n"
         "/cd — график кумулятивной дельты\n"
-        "/otchet — текстовый отчёт\n\n"
+        "/otchet — текстовый отчёт\n"
+        "/custom_cd — отчёт CD за период\n\n"
         f"Биржи: {exchanges}"
     )
 
@@ -98,7 +115,7 @@ async def cmd_list(message: Message, state: FSMContext) -> None:
     await state.clear()
     try:
         pairs = await get_hub().list_pairs()
-        await message.answer(format_pair_list(pairs))
+        await _answer_mono(message, format_pair_list(pairs))
     except Exception as exc:
         await message.answer(friendly_error(exc))
 
@@ -108,17 +125,96 @@ async def cmd_otchet(message: Message, state: FSMContext) -> None:
     if not _auth_message(message):
         return
     await state.clear()
-    parts = (message.text or "").split()
-    if len(parts) < 2:
-        await message.answer("Использование: /otchet <тикер>")
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) >= 2 and parts[1].strip():
+        await _send_otchet(message, parts[1].strip().split()[0])
         return
-    coin = parts[1]
+    await state.set_state(OtchetStates.waiting_ticker)
+    await message.answer("введите тикер")
+
+
+@router.message(OtchetStates.waiting_ticker)
+async def otchet_ticker(message: Message, state: FSMContext) -> None:
+    if not _auth_message(message):
+        return
+    ticker = (message.text or "").strip()
+    if not ticker or ticker.startswith("/"):
+        await message.answer("введите тикер")
+        return
+    await state.clear()
+    await _send_otchet(message, ticker.split()[0])
+
+
+async def _send_otchet(message: Message, coin: str) -> None:
     try:
-        sections = await build_otchet(coin)
-        text = format_report(coin, sections)
-        if len(text) > 4000:
-            text = text[:4000] + "\n…"
-        await message.answer(text)
+        data = await build_otchet_v2(coin, get_hub())
+        await _answer_mono(message, format_otchet_mono(data))
+    except Exception as exc:
+        await message.answer(friendly_error(exc))
+
+
+@router.message(Command("custom_cd"))
+async def cmd_custom_cd(message: Message, state: FSMContext) -> None:
+    if not _auth_message(message):
+        return
+    await state.clear()
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) >= 2 and parts[1].strip():
+        await state.update_data(coin=parts[1].strip().split()[0].upper())
+        await state.set_state(CustomCdStates.waiting_period)
+        now_s = format_dt(now_display())
+        await message.answer(
+            f"введите период\nТекущее время: {now_s}\n"
+            "Формат: 2026-09-08 20:00 - 2026-09-10 12:00 или 6h / 1d"
+        )
+        return
+    await state.set_state(CustomCdStates.waiting_ticker)
+    await message.answer("введите тикер")
+
+
+@router.message(CustomCdStates.waiting_ticker)
+async def custom_cd_ticker(message: Message, state: FSMContext) -> None:
+    if not _auth_message(message):
+        return
+    ticker = (message.text or "").strip()
+    if not ticker or ticker.startswith("/"):
+        await message.answer("введите тикер")
+        return
+    await state.update_data(coin=ticker.split()[0].upper())
+    await state.set_state(CustomCdStates.waiting_period)
+    now_s = format_dt(now_display())
+    await message.answer(
+        f"введите период\nТекущее время: {now_s}\n"
+        "Формат: 2026-09-08 20:00 - 2026-09-10 12:00 или 6h / 1d"
+    )
+
+
+@router.message(CustomCdStates.waiting_period)
+async def custom_cd_period(message: Message, state: FSMContext) -> None:
+    if not _auth_message(message):
+        return
+    data = await state.get_data()
+    coin = data.get("coin")
+    if not coin:
+        await state.clear()
+        await message.answer("Сессия сброшена. Начните снова: /custom_cd")
+        return
+    try:
+        from datetime import datetime, timezone
+
+        start, end = parse_interval_text(
+            message.text or "",
+            observation_start=datetime.now(timezone.utc),
+        )
+        if start is None:
+            raise ValueError(
+                "Укажите период, например: 6h или 2026-09-08 20:00 - 2026-09-10 12:00"
+            )
+        if end is None:
+            end = datetime.now(timezone.utc)
+        report = await build_custom_cd_report(coin, get_hub(), start, end)
+        await state.clear()
+        await _answer_mono(message, format_custom_cd_mono(report))
     except Exception as exc:
         await message.answer(friendly_error(exc))
 
@@ -160,9 +256,13 @@ async def _run_check(message: Message, ticker: str) -> None:
         rows = await get_hub().check_volumes(coin)
         text = format_check_table(coin, rows)
         if not rows:
-            await message.answer(text)
+            await _answer_mono(message, text)
             return
-        await message.answer(text, reply_markup=check_actions_keyboard(coin))
+        await message.answer(
+            _html_pre(text),
+            parse_mode="HTML",
+            reply_markup=check_actions_keyboard(coin),
+        )
     except Exception as exc:
         await message.answer(friendly_error(exc))
 
@@ -563,19 +663,35 @@ async def _send_cd_chart(message: Message, state: FSMContext, interval_text: str
 # Alerts / setup
 # ---------------------------------------------------------------------------
 
+_rsi_bot: Bot | None = None
+_rsi_chat_id: int | None = None
+
+
+def set_rsi_bot(bot: Bot | None, chat_id: int | None) -> None:
+    global _rsi_bot, _rsi_chat_id
+    _rsi_bot = bot
+    _rsi_chat_id = chat_id
+
 
 async def send_alert(bot: Bot, chat_id: int, alert: dict) -> None:
     t = alert.get("type")
     if t == "big_trade":
         text = format_big_alert(alert)
+        target_bot, target_chat = bot, chat_id
     elif t == "cd_spike":
         text = format_cd_alert(alert)
+        target_bot, target_chat = bot, chat_id
     elif t == "rsi_divergence":
         text = format_rsi_alert(alert)
+        if _rsi_bot is not None and _rsi_chat_id is not None:
+            target_bot, target_chat = _rsi_bot, _rsi_chat_id
+        else:
+            target_bot, target_chat = bot, chat_id
     else:
         text = f"Alert: {alert}"
+        target_bot, target_chat = bot, chat_id
     try:
-        await bot.send_message(chat_id, text)
+        await target_bot.send_message(target_chat, text)
     except Exception as exc:
         logger.exception("Failed to send telegram alert: %s", exc)
 
@@ -591,6 +707,7 @@ async def setup_bot_commands(bot: Bot) -> None:
             BotCommand(command="list", description="Список пар"),
             BotCommand(command="cd", description="График кумулятивной дельты"),
             BotCommand(command="otchet", description="Отчёт по монете"),
+            BotCommand(command="custom_cd", description="Отчёт CD за период"),
         ]
     )
 

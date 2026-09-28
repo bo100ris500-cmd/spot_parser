@@ -73,21 +73,33 @@ def format_big_alert(alert: dict[str, Any]) -> str:
 
 def format_cd_alert(alert: dict[str, Any]) -> str:
     direction = "покупки" if alert.get("direction") == "buy_pressure" else "продажи"
+    exchange = display_name(str(alert.get("exchange") or ""))
+    coin = str(alert.get("coin") or "").upper()
+    tf = alert.get("timeframe") or f"{int(alert.get('window_sec', 0))}s"
+    delta = float(alert.get("delta_window") or 0)
+    pct = float(alert.get("imbalance_pct") or 0)
+    cum = float(alert.get("cum_delta") or 0)
+    sign_d = "+" if delta >= 0 else "−"
+    sign_c = "+" if cum >= 0 else "−"
     return (
-        f"⚡ Резкая дельта (перевес {direction})\n"
-        f"Биржа: {display_name(str(alert.get('exchange') or ''))}\n"
-        f"Пара: {alert.get('symbol')}\n"
-        f"Δ за {int(alert.get('window_sec', 300))}с: {alert.get('delta_window'):+.6g}\n"
-        f"Накопленная Δ: {alert.get('cum_delta'):+.6g}"
+        f"⚡️ Перевес {direction}\n"
+        f"{exchange} {coin}\n"
+        f"Δ за {tf} {sign_d}${abs(delta):,.2f}\n"
+        f"{pct:.2f}% от объёма\n"
+        f"Накопленная Δ: {sign_c}${abs(cum):,.2f}"
     )
 
 
 def format_rsi_alert(alert: dict[str, Any]) -> str:
     kind = "бычья" if alert.get("divergence") == "bullish" else "медвежья"
+    exchanges = alert.get("exchanges_display") or [
+        display_name(str(alert.get("exchange") or ""))
+    ]
+    ex_s = ", ".join(exchanges)
     return (
         f"📉 RSI-дивергенция ({kind})\n"
-        f"Биржа: {display_name(str(alert.get('exchange') or ''))}\n"
-        f"Пара: {alert.get('symbol')}\n"
+        f"Токен: {str(alert.get('coin') or '').upper()}\n"
+        f"Биржи: {ex_s}\n"
         f"ТФ: {alert.get('timeframe')}\n"
         f"Цена: {alert.get('price_a'):.6g} → {alert.get('price_b'):.6g}\n"
         f"RSI: {alert.get('rsi_a'):.2f} → {alert.get('rsi_b'):.2f}"

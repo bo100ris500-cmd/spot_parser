@@ -30,13 +30,18 @@ class RuntimeHub:
     def __init__(self, config: AppConfig, publisher: AlertPublisher) -> None:
         self.config = config
         self.publisher = publisher
-        self.big = BigTradeDetector(config, publisher)
+        self.big = BigTradeDetector(
+            config, publisher, most_liquid_exchange=self.most_liquid_big_exchange
+        )
         self.cd = CumDeltaEngine(config, publisher)
         self.adapters: dict[str, CcxtExchangeAdapter] = {}
         self.collectors: dict[int, TradeCollector] = {}
         self.kline_collector = KlineCollector(config, publisher, self)
         self._flush_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
+        # coin -> [(exchange, volume), ...] sorted desc; refreshed periodically
+        self._liquidity_cache: dict[str, tuple[float, list[tuple[str, float]]]] = {}
+        self._paused_pairs: set[int] = set()
 
     async def start(self) -> None:
         enabled = list(self.config.get("exchanges", "enabled", default=[]))
@@ -101,20 +106,111 @@ class RuntimeHub:
         )
         if pair.id in self.collectors:
             return
-        # Need a live trade stream if either tracking mode is on
         if not pair.flag_big and not pair.flag_cd:
             return
         adapter = self.get_adapter(pair.exchange)
         if adapter is None:
             logger.warning("No adapter for %s, pair %s not streaming", pair.exchange, pair.symbol)
             return
+        resolved = adapter.resolve_symbol(pair.coin)
+        if resolved is None:
+            logger.warning(
+                "Symbol not available on %s for %s — stream not started",
+                pair.exchange,
+                pair.coin,
+            )
+            self._paused_pairs.add(pair.id)
+            return
+        if resolved != pair.symbol:
+            pair.symbol = resolved
         collector = TradeCollector(adapter, pair.id, pair.symbol, self)
         self.collectors[pair.id] = collector
         collector.start()
 
+    def is_pair_active(self, pair_id: int) -> bool:
+        return pair_id not in self._paused_pairs
+
     async def on_trade(self, pair_id: int, trade: NormalizedTrade) -> None:
         await self.big.on_trade(pair_id, trade)
         await self.cd.on_trade(pair_id, trade)
+
+    async def on_stream_paused(self, pair_id: int, reason: str) -> None:
+        self._paused_pairs.add(pair_id)
+        collector = self.collectors.pop(pair_id, None)
+        if collector:
+            # already stopping itself; just detach
+            pass
+        logger.warning("Stream paused pair_id=%s: %s", pair_id, reason)
+
+    async def rank_liquidity(self, coin: str, *, force: bool = False) -> list[tuple[str, float]]:
+        """Return [(exchange, quote_volume)] for coin across adapters, desc."""
+        coin = coin.upper().strip()
+        now = asyncio.get_event_loop().time()
+        cached = self._liquidity_cache.get(coin)
+        if cached and not force and now - cached[0] < 300:
+            return cached[1]
+
+        rows: list[tuple[str, float]] = []
+
+        async def _one(name: str, adapter: CcxtExchangeAdapter) -> tuple[str, float] | None:
+            try:
+                symbol = adapter.resolve_symbol(coin)
+                if not symbol:
+                    return None
+                vol = await adapter.fetch_quote_volume(symbol)
+                return (name, float(vol or 0.0))
+            except Exception:
+                return None
+
+        results = await asyncio.gather(
+            *[_one(n, a) for n, a in self.adapters.items()], return_exceptions=True
+        )
+        for item in results:
+            if isinstance(item, tuple):
+                rows.append(item)
+        rows.sort(key=lambda x: x[1], reverse=True)
+        self._liquidity_cache[coin] = (now, rows)
+        return rows
+
+    async def top_liquid_exchanges(self, coin: str, n: int = 3) -> list[str]:
+        ranked = await self.rank_liquidity(coin)
+        return [ex for ex, _ in ranked[:n] if _ > 0] or [ex for ex, _ in ranked[:n]]
+
+    async def most_liquid_big_exchange(self, coin: str) -> str | None:
+        """Most liquid exchange among watched pairs with flag_big for this coin."""
+        factory = get_session_factory()
+        async with factory() as session:
+            result = await session.execute(
+                select(WatchedPair).where(
+                    WatchedPair.coin == coin.upper(),
+                    WatchedPair.flag_big.is_(True),
+                )
+            )
+            pairs = list(result.scalars().all())
+        if not pairs:
+            return None
+        watched = {p.exchange for p in pairs}
+        ranked = await self.rank_liquidity(coin)
+        for ex, _vol in ranked:
+            if ex in watched:
+                return ex
+        return pairs[0].exchange
+
+    async def is_most_liquid_big(self, coin: str, exchange: str) -> bool:
+        """Kept for compatibility; prefer most_liquid_big_exchange."""
+        top = await self.most_liquid_big_exchange(coin)
+        if top is None:
+            return True
+        return top == exchange.lower()
+
+    async def exchanges_with_spot(self, coin: str) -> list[tuple[str, str]]:
+        """[(exchange, symbol), ...] where spot market exists."""
+        out: list[tuple[str, str]] = []
+        for name, adapter in self.adapters.items():
+            symbol = adapter.resolve_symbol(coin)
+            if symbol:
+                out.append((name, symbol))
+        return out
 
     async def add_or_update_pair(
         self,

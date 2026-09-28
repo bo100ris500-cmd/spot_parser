@@ -14,6 +14,9 @@ class Settings(BaseSettings):
 
     bot_token: str = Field(alias="BOT_TOKEN")
     allowed_chat_id: int = Field(alias="ALLOWED_CHAT_ID")
+    # Optional separate bot for RSI alerts
+    rsi_bot_token: str | None = Field(default=None, alias="RSI_BOT_TOKEN")
+    rsi_allowed_chat_id: int | None = Field(default=None, alias="RSI_ALLOWED_CHAT_ID")
     database_url: str = Field(alias="DATABASE_URL")
     redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")

@@ -2,17 +2,24 @@ big:
   window_minutes: 60
   k_multiplier: 15
   aggregate_ms: 1500
+  # Shared USD threshold from the most liquid watched exchange; alerts on ALL venues
+  threshold_from_most_liquid: true
 
 cd:
-  alert_window_sec: 300
-  alert_pct: 5
+  # Multi-TF imbalance alerts: |Δ| / volume >= alert_pct within each window
+  alert_pct: 20
   cooldown_sec: 600
+  alert_timeframes: [5m, 15m, 1h, 4h, 1d]
+  # Keep short event history for largest TF (1d) + margin
+  event_history_sec: 90000
 
 rsi:
   period: 14
   timeframes: [1h, 4h, 1d]
   swing_lookback: 8
   min_swing_distance: 3
+  # Only check RSI on N most liquid exchanges for the coin
+  top_liquid_exchanges: 3
 
 report:
   timeframes: [15m, 1h, 4h, 1d, 1w]
@@ -24,6 +31,12 @@ bucket:
   seconds: 60
 
 flush_interval_sec: 2
+
+reconnect:
+  base_delay: 2.0
+  max_delay: 300.0
+  # After this many consecutive hard failures, pause the stream
+  max_attempts_before_pause: 30
 
 exchanges:
   enabled:

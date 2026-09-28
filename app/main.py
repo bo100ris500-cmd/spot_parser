@@ -6,7 +6,13 @@ from aiogram import Bot
 
 from sqlalchemy import text
 
-from app.bot.handlers import create_dispatcher, send_alert, set_hub, setup_bot_commands
+from app.bot.handlers import (
+    create_dispatcher,
+    send_alert,
+    set_hub,
+    set_rsi_bot,
+    setup_bot_commands,
+)
 from app.config import get_app_config, get_settings
 from app.db.models import Base
 from app.db.session import get_engine, get_session_factory
@@ -51,6 +57,15 @@ async def run() -> None:
     await setup_bot_commands(bot)
     dp = create_dispatcher()
 
+    rsi_bot: Bot | None = None
+    if settings.rsi_bot_token and settings.rsi_allowed_chat_id:
+        rsi_bot = Bot(token=settings.rsi_bot_token)
+        set_rsi_bot(rsi_bot, settings.rsi_allowed_chat_id)
+        logger.info("RSI alerts → separate bot chat_id=%s", settings.rsi_allowed_chat_id)
+    else:
+        set_rsi_bot(None, None)
+        logger.info("RSI alerts → main bot (RSI_BOT_TOKEN not set)")
+
     async def on_alert(alert: dict) -> None:
         await send_alert(bot, settings.allowed_chat_id, alert)
 
@@ -66,6 +81,8 @@ async def run() -> None:
         await consumer.stop()
         await hub.stop()
         await bot.session.close()
+        if rsi_bot is not None:
+            await rsi_bot.session.close()
         await redis.aclose()
         await get_engine().dispose()
 

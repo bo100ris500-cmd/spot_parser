@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 from app.exchanges.base import NormalizedTrade
 from app.exchanges.ccxt_adapter import CcxtExchangeAdapter
 from app.utils.logging import get_logger
-from app.utils.reconnect import with_exponential_backoff
+from app.utils.reconnect import PermanentStreamError, with_exponential_backoff
 
 if TYPE_CHECKING:
     from app.services.runtime import RuntimeHub
@@ -15,7 +15,7 @@ logger = get_logger(__name__)
 
 
 class TradeCollector:
-    """Per-pair trade stream with independent reconnect."""
+    """Per-pair trade stream with independent reconnect and permanent-failure pause."""
 
     def __init__(
         self,
@@ -31,9 +31,11 @@ class TradeCollector:
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._seen: set[str] = set()
+        self.paused_reason: str | None = None
 
     def start(self) -> None:
         self._stop.clear()
+        self.paused_reason = None
         self._task = asyncio.create_task(
             self._run(), name=f"trades-{self.adapter.name}-{self.symbol}"
         )
@@ -55,6 +57,10 @@ class TradeCollector:
             self.symbol,
             self.pair_id,
         )
+        cfg = self.hub.config
+        base_delay = float(cfg.get("reconnect", "base_delay", default=2.0))
+        max_delay = float(cfg.get("reconnect", "max_delay", default=300.0))
+        max_attempts = int(cfg.get("reconnect", "max_attempts_before_pause", default=30))
 
         async def _loop() -> None:
             async for trades in self.adapter.watch_trades(self.symbol):
@@ -73,11 +79,23 @@ class TradeCollector:
                 await with_exponential_backoff(
                     _loop,
                     name=f"ws:{self.adapter.name}:{self.symbol}",
-                    base_delay=1.0,
-                    max_delay=60.0,
+                    base_delay=base_delay,
+                    max_delay=max_delay,
+                    max_attempts=max_attempts,
                 )
             except asyncio.CancelledError:
                 raise
+            except PermanentStreamError as exc:
+                self.paused_reason = str(exc)
+                logger.error(
+                    "Pausing trade stream %s %s: %s",
+                    self.adapter.name,
+                    self.symbol,
+                    exc,
+                )
+                # Notify hub so pair can be marked / collector removed from hot path
+                await self.hub.on_stream_paused(self.pair_id, str(exc))
+                return
             except Exception as exc:
                 logger.exception(
                     "Trade collector fatal for %s %s: %s",
