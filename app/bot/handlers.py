@@ -676,30 +676,42 @@ def set_rsi_bot(bot: Bot | None, chat_id: int | None) -> None:
 
 async def send_alert(bot: Bot, chat_id: int, alert: dict) -> None:
     from app.notify.pushover import send_pushover
+    from app.notify.telegram_outbox import (
+        PRIO_BIG,
+        PRIO_CD,
+        PRIO_COMBO,
+        PRIO_OTHER,
+        PRIO_RSI,
+        get_outbox,
+    )
 
     t = alert.get("type")
     if t == "big_trade":
         text = format_big_alert(alert)
         target_bot, target_chat = bot, chat_id
+        priority = PRIO_BIG
     elif t == "cd_spike":
         text = format_cd_alert(alert)
         target_bot, target_chat = bot, chat_id
+        priority = PRIO_CD
     elif t == "cd_combo":
         text = format_cd_combo_alert(alert)
         target_bot, target_chat = bot, chat_id
+        priority = PRIO_COMBO
     elif t == "rsi_divergence":
         text = format_rsi_alert(alert)
         if _rsi_bot is not None and _rsi_chat_id is not None:
             target_bot, target_chat = _rsi_bot, _rsi_chat_id
         else:
             target_bot, target_chat = bot, chat_id
+        priority = PRIO_RSI
     else:
         text = f"Alert: {alert}"
         target_bot, target_chat = bot, chat_id
-    try:
-        await target_bot.send_message(target_chat, text)
-    except Exception as exc:
-        logger.exception("Failed to send telegram alert: %s", exc)
+        priority = PRIO_OTHER
+
+    outbox = get_outbox()
+    await outbox.send(target_bot, target_chat, text, priority=priority)
 
     if alert.get("pushover") or t == "cd_combo":
         try:

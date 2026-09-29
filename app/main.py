@@ -18,6 +18,7 @@ from app.db.models import Base
 from app.db.session import get_engine, get_session_factory
 from app.notify.consumer import AlertConsumer
 from app.notify.publisher import AlertPublisher, create_redis
+from app.notify.telegram_outbox import init_outbox
 from app.services.runtime import RuntimeHub
 from app.utils.logging import get_logger, setup_logging
 
@@ -57,6 +58,12 @@ async def run() -> None:
     await setup_bot_commands(bot)
     dp = create_dispatcher()
 
+    outbox = init_outbox(
+        min_interval_sec=float(config.get("telegram", "min_interval_sec", default=1.5)),
+        max_queue=int(config.get("telegram", "max_queue", default=80)),
+    )
+    outbox.start()
+
     rsi_bot: Bot | None = None
     if settings.rsi_bot_token and settings.rsi_allowed_chat_id:
         rsi_bot = Bot(token=settings.rsi_bot_token)
@@ -79,6 +86,7 @@ async def run() -> None:
     finally:
         logger.info("Shutting down…")
         await consumer.stop()
+        await outbox.stop()
         await hub.stop()
         await bot.session.close()
         if rsi_bot is not None:
