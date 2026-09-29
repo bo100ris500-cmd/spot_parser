@@ -71,6 +71,27 @@ def format_big_alert(alert: dict[str, Any]) -> str:
     )
 
 
+def _ru_occurrence_label(n: int) -> str | None:
+    """Return label for 2nd+ combo firing; None for the first."""
+    if n <= 1:
+        return None
+    special = {
+        2: "второе",
+        3: "третье",
+        4: "четвёртое",
+        5: "пятое",
+        6: "шестое",
+        7: "седьмое",
+        8: "восьмое",
+        9: "девятое",
+        10: "десятое",
+    }
+    word = special.get(n)
+    if word:
+        return f"{word} срабатывание"
+    return f"{n}-е срабатывание"
+
+
 def format_cd_alert(alert: dict[str, Any]) -> str:
     direction = "покупки" if alert.get("direction") == "buy_pressure" else "продажи"
     exchange = display_name(str(alert.get("exchange") or ""))
@@ -106,19 +127,28 @@ def format_cd_combo_alert(alert: dict[str, Any]) -> str:
     cum = float(alert.get("cum_delta") or 0)
     sign_c = "+" if cum >= 0 else "−"
     sign_p = "+" if price_pct >= 0 else "−"
+    occ = int(alert.get("occurrence") or 1)
+    occ_label = _ru_occurrence_label(occ)
 
     def _line(tf: str, d: float, imb: float) -> str:
         s = "+" if d >= 0 else "−"
         return f"Δ за {tf} {s}{abs(d):,.2f}$ {imb:.1f}% объема"
 
-    return (
-        f"🔥 КОМБО ⚡️ Перевес {direction}\n"
-        f"{exchange} {coin}\n"
-        f"{_line('15m', d15, p15)}\n"
-        f"{_line('1h', d1h, p1h)}\n"
-        f"Δ цены {sign_p}{abs(price_pct):.2f}% {price:.6g}\n"
-        f"Накопленная Δ: {sign_c}{abs(cum):,.2f} $"
+    lines = [
+        f"🔥 КОМБО ⚡️ Перевес {direction}",
+        f"{exchange} {coin}",
+    ]
+    if occ_label:
+        lines.append(occ_label)
+    lines.extend(
+        [
+            _line("15m", d15, p15),
+            _line("1h", d1h, p1h),
+            f"Δ цены {sign_p}{abs(price_pct):.2f}% {price:.6g}",
+            f"Накопленная Δ: {sign_c}{abs(cum):,.2f} $",
+        ]
     )
+    return "\n".join(lines)
 
 
 def format_rsi_alert(alert: dict[str, Any]) -> str:

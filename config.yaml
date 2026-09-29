@@ -6,14 +6,23 @@ big:
   threshold_from_most_liquid: true
 
 cd:
-  # |Δ| / volume >= alert_pct within each window
+  # |Δ_current| / volume_PREVIOUS_interval >= alert_pct
   alert_pct: 40
   cooldown_sec: 600
   combo_cooldown_sec: 600
   combo_max_price_pct: 5
+  # Pushover for COMBO: at most once per coin per hour
+  combo_pushover_cooldown_sec: 3600
+  # Reset "второе/третье срабатывание" streak after quiet hour
+  combo_streak_reset_sec: 3600
   alert_timeframes: [15m, 30m, 1h, 4h, 12h, 24h]
-  # Keep history for largest TF (24h) + margin
-  event_history_sec: 90000
+  # Anti spam / cold-start guards
+  min_volume_usd: 2000
+  min_abs_delta_usd: 500
+  min_trades: 15
+  min_window_fill_ratio: 0.7
+  # Need ~2x largest TF of history (prev + current)
+  event_history_sec: 180000
 
 rsi:
   period: 14

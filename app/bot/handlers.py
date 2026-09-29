@@ -713,7 +713,7 @@ async def send_alert(bot: Bot, chat_id: int, alert: dict) -> None:
     outbox = get_outbox()
     await outbox.send(target_bot, target_chat, text, priority=priority)
 
-    if alert.get("pushover") or t == "cd_combo":
+    if alert.get("pushover"):
         try:
             await send_pushover(
                 title=f"КОМБО {alert.get('coin', '')} {alert.get('exchange', '')}",
