@@ -12,6 +12,7 @@ from app.bot.auth import is_allowed
 from app.bot.formatters import (
     format_big_alert,
     format_cd_alert,
+    format_cd_combo_alert,
     format_check_table,
     format_pair_list,
     format_rsi_alert,
@@ -674,12 +675,17 @@ def set_rsi_bot(bot: Bot | None, chat_id: int | None) -> None:
 
 
 async def send_alert(bot: Bot, chat_id: int, alert: dict) -> None:
+    from app.notify.pushover import send_pushover
+
     t = alert.get("type")
     if t == "big_trade":
         text = format_big_alert(alert)
         target_bot, target_chat = bot, chat_id
     elif t == "cd_spike":
         text = format_cd_alert(alert)
+        target_bot, target_chat = bot, chat_id
+    elif t == "cd_combo":
+        text = format_cd_combo_alert(alert)
         target_bot, target_chat = bot, chat_id
     elif t == "rsi_divergence":
         text = format_rsi_alert(alert)
@@ -694,6 +700,16 @@ async def send_alert(bot: Bot, chat_id: int, alert: dict) -> None:
         await target_bot.send_message(target_chat, text)
     except Exception as exc:
         logger.exception("Failed to send telegram alert: %s", exc)
+
+    if alert.get("pushover") or t == "cd_combo":
+        try:
+            await send_pushover(
+                title=f"КОМБО {alert.get('coin', '')} {alert.get('exchange', '')}",
+                message=text,
+                priority=int(alert.get("pushover_priority") or 2),
+            )
+        except Exception as exc:
+            logger.exception("Pushover failed: %s", exc)
 
 
 async def setup_bot_commands(bot: Bot) -> None:

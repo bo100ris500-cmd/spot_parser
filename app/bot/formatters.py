@@ -78,15 +78,46 @@ def format_cd_alert(alert: dict[str, Any]) -> str:
     tf = alert.get("timeframe") or f"{int(alert.get('window_sec', 0))}s"
     delta = float(alert.get("delta_window") or 0)
     pct = float(alert.get("imbalance_pct") or 0)
+    price_pct = float(alert.get("price_pct") or 0)
+    price = float(alert.get("price") or 0)
     cum = float(alert.get("cum_delta") or 0)
     sign_d = "+" if delta >= 0 else "−"
     sign_c = "+" if cum >= 0 else "−"
+    sign_p = "+" if price_pct >= 0 else "−"
     return (
         f"⚡️ Перевес {direction}\n"
         f"{exchange} {coin}\n"
-        f"Δ за {tf} {sign_d}${abs(delta):,.2f}\n"
-        f"{pct:.2f}% от объёма\n"
-        f"Накопленная Δ: {sign_c}${abs(cum):,.2f}"
+        f"Δ за {tf} {sign_d}{abs(delta):,.2f}$ {pct:.1f}% объема\n"
+        f"Δ цены {sign_p}{abs(price_pct):.2f}% {price:.6g}\n"
+        f"Накопленная Δ: {sign_c}{abs(cum):,.2f} $"
+    )
+
+
+def format_cd_combo_alert(alert: dict[str, Any]) -> str:
+    direction = "покупки" if alert.get("direction") == "buy_pressure" else "продажи"
+    exchange = display_name(str(alert.get("exchange") or ""))
+    coin = str(alert.get("coin") or "").upper()
+    d15 = float(alert.get("delta_15m") or 0)
+    d1h = float(alert.get("delta_1h") or 0)
+    p15 = float(alert.get("imbalance_15m") or 0)
+    p1h = float(alert.get("imbalance_1h") or 0)
+    price_pct = float(alert.get("price_pct") or 0)
+    price = float(alert.get("price") or 0)
+    cum = float(alert.get("cum_delta") or 0)
+    sign_c = "+" if cum >= 0 else "−"
+    sign_p = "+" if price_pct >= 0 else "−"
+
+    def _line(tf: str, d: float, imb: float) -> str:
+        s = "+" if d >= 0 else "−"
+        return f"Δ за {tf} {s}{abs(d):,.2f}$ {imb:.1f}% объема"
+
+    return (
+        f"🔥 КОМБО ⚡️ Перевес {direction}\n"
+        f"{exchange} {coin}\n"
+        f"{_line('15m', d15, p15)}\n"
+        f"{_line('1h', d1h, p1h)}\n"
+        f"Δ цены {sign_p}{abs(price_pct):.2f}% {price:.6g}\n"
+        f"Накопленная Δ: {sign_c}{abs(cum):,.2f} $"
     )
 
 

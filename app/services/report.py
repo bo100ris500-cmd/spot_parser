@@ -357,13 +357,15 @@ def format_otchet_mono(data: dict[str, Any]) -> str:
     coin = data["coin"]
     lines: list[str] = [f"Отчёт по {coin}"]
 
+    def _row(name: str, delta: float, pct: float) -> str:
+        return f"{name:<12}| {_fmt_num(delta):>12} | {_fmt_pct(pct):>9}"
+
     def _block(title: str, price_pct: float, agg_d: float, agg_p: float, rows: list[dict]) -> None:
         lines.append("")
         lines.append(f"{title} {_fmt_pct(price_pct)}")
-        lines.append(f"Агрегированно {_fmt_num(agg_d)}\t{_fmt_pct(agg_p)}")
+        lines.append(_row("агр", agg_d, agg_p))
         for r in rows:
-            name = display_name(r["exchange"]).ljust(10)
-            lines.append(f"{name}\t{_fmt_num(r['delta_abs'])}\t{_fmt_pct(r['delta_pct'])}")
+            lines.append(_row(display_name(r["exchange"]), r["delta_abs"], r["delta_pct"]))
 
     for block in data["timeframes"]:
         _block(
@@ -392,16 +394,19 @@ def format_custom_cd_mono(data: dict[str, Any]) -> str:
     coin = data["coin"]
     start_s = format_dt(data["start"])
     end_s = format_dt(data["end"])
+
+    def _row(name: str, delta: float, pct: float, mark: str = "") -> str:
+        return f"{name:<12}| {_fmt_num(delta):>12} | {_fmt_pct(pct):>9}{mark}"
+
     lines = [
         f"Отчёт по {coin}",
         f"Интервал {start_s} — {end_s}",
         f"Изменение цены {_fmt_pct(data['price_pct'])}",
-        f"Агрегированно {_fmt_num(data['agg_delta'])}\t{_fmt_pct(data['agg_pct'])}",
+        _row("агр", data["agg_delta"], data["agg_pct"]),
     ]
     for r in data["rows"]:
-        name = display_name(r["exchange"]).ljust(10)
         mark = " *" if r.get("live") else ""
-        lines.append(f"{name}\t{_fmt_num(r['delta_abs'])}\t{_fmt_pct(r['delta_pct'])}{mark}")
+        lines.append(_row(display_name(r["exchange"]), r["delta_abs"], r["delta_pct"], mark))
     if any(r.get("live") for r in data["rows"]):
         lines.append("")
         lines.append("* данные подтянуты без сохранения в БД")

@@ -4,7 +4,7 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Awaitable
+from typing import Any, Awaitable, Callable
 
 from app.config import AppConfig
 from app.exchanges.base import NormalizedTrade
@@ -14,10 +14,13 @@ from app.utils.logging import get_logger
 logger = get_logger(__name__)
 
 TF_SEC = {
-    "5m": 5 * 60,
     "15m": 15 * 60,
+    "30m": 30 * 60,
     "1h": 60 * 60,
     "4h": 4 * 60 * 60,
+    "12h": 12 * 60 * 60,
+    "24h": 24 * 60 * 60,
+    # aliases
     "1d": 24 * 60 * 60,
 }
 
@@ -26,9 +29,10 @@ TF_SEC = {
 class PairDeltaRuntime:
     cum_delta_base: float = 0.0
     cum_delta_usd: float = 0.0
-    # (ts, signed_usd, abs_usd)
-    events: deque[tuple[float, float, float]] = field(default_factory=deque)
+    # (ts, signed_usd, abs_usd, price)
+    events: deque[tuple[float, float, float, float]] = field(default_factory=deque)
     last_alert_ts: dict[str, float] = field(default_factory=dict)
+    last_price: float = 0.0
     dirty: bool = False
 
 
@@ -110,6 +114,26 @@ class CumDeltaEngine:
             self._buckets[pair_id] = {}
         return rows
 
+    @staticmethod
+    def _window_stats(
+        rt: PairDeltaRuntime, now: float, window: float
+    ) -> tuple[float, float, float, float] | None:
+        """Return (delta_usd, vol_usd, price_pct, last_price) or None."""
+        events = [e for e in rt.events if e[0] >= now - window]
+        if not events:
+            return None
+        delta_usd = sum(e[1] for e in events)
+        vol_usd = sum(e[2] for e in events)
+        if vol_usd <= 0:
+            return None
+        first_price = events[0][3]
+        last_price = events[-1][3]
+        if first_price <= 0:
+            price_pct = 0.0
+        else:
+            price_pct = (last_price / first_price - 1.0) * 100.0
+        return delta_usd, vol_usd, price_pct, last_price
+
     async def on_trade(self, pair_id: int, trade: NormalizedTrade) -> None:
         meta = self._meta.get(pair_id)
         if not meta or not meta.get("alerts_enabled"):
@@ -121,10 +145,11 @@ class CumDeltaEngine:
         signed_usd = trade.cost if trade.side == "buy" else -trade.cost
         rt.cum_delta_base += signed_base
         rt.cum_delta_usd += signed_usd
+        rt.last_price = trade.price
         rt.dirty = True
 
         now = time.time()
-        rt.events.append((now, signed_usd, abs(trade.cost)))
+        rt.events.append((now, signed_usd, abs(trade.cost), float(trade.price)))
 
         hist = float(self.config.get("cd", "event_history_sec", default=90000))
         cutoff = now - hist
@@ -146,11 +171,21 @@ class CumDeltaEngine:
         await self._maybe_alert(pair_id, rt, now)
 
     async def _maybe_alert(self, pair_id: int, rt: PairDeltaRuntime, now: float) -> None:
-        pct = float(self.config.get("cd", "alert_pct", default=20))
+        pct = float(self.config.get("cd", "alert_pct", default=40))
         cooldown = float(self.config.get("cd", "cooldown_sec", default=600))
-        tfs = list(self.config.get("cd", "alert_timeframes", default=["5m", "15m", "1h", "4h", "1d"]))
+        combo_cooldown = float(self.config.get("cd", "combo_cooldown_sec", default=cooldown))
+        price_max = float(self.config.get("cd", "combo_max_price_pct", default=5))
+        tfs = list(
+            self.config.get(
+                "cd",
+                "alert_timeframes",
+                default=["15m", "30m", "1h", "4h", "12h", "24h"],
+            )
+        )
 
         meta = self._meta[pair_id]
+        hits: dict[str, dict[str, Any]] = {}
+
         for tf in tfs:
             window = float(TF_SEC.get(tf, 0))
             if window <= 0:
@@ -158,28 +193,91 @@ class CumDeltaEngine:
             last = rt.last_alert_ts.get(tf, 0.0)
             if now - last < cooldown:
                 continue
-
-            delta_usd = sum(d for ts, d, _ in rt.events if ts >= now - window)
-            vol_usd = sum(a for ts, _, a in rt.events if ts >= now - window)
-            if vol_usd <= 0:
+            stats = self._window_stats(rt, now, window)
+            if stats is None:
                 continue
-
+            delta_usd, vol_usd, price_pct, last_price = stats
             imbalance_pct = abs(delta_usd) / vol_usd * 100.0
             if imbalance_pct < pct:
                 continue
+            hits[tf] = {
+                "delta_usd": delta_usd,
+                "vol_usd": vol_usd,
+                "imbalance_pct": imbalance_pct,
+                "price_pct": price_pct,
+                "price": last_price,
+                "window_sec": int(window),
+                "direction": "buy_pressure" if delta_usd > 0 else "sell_pressure",
+            }
 
-            direction = "buy_pressure" if delta_usd > 0 else "sell_pressure"
+        if not hits:
+            return
+
+        # COMBO: 15m + 1h both hit, |Δprice| over 1h < threshold
+        combo_ready = (
+            "15m" in hits
+            and "1h" in hits
+            and abs(hits["1h"]["price_pct"]) < price_max
+            and now - rt.last_alert_ts.get("combo", 0.0) >= combo_cooldown
+        )
+
+        if combo_ready:
+            h15, h1h = hits["15m"], hits["1h"]
+            # Prefer stronger absolute delta for headline numbers
+            primary = h1h if abs(h1h["delta_usd"]) >= abs(h15["delta_usd"]) else h15
+            alert = {
+                "type": "cd_combo",
+                "pair_id": pair_id,
+                "exchange": meta["exchange"],
+                "symbol": meta["symbol"],
+                "coin": meta["coin"],
+                "delta_window": primary["delta_usd"],
+                "delta_15m": h15["delta_usd"],
+                "delta_1h": h1h["delta_usd"],
+                "imbalance_pct": primary["imbalance_pct"],
+                "imbalance_15m": h15["imbalance_pct"],
+                "imbalance_1h": h1h["imbalance_pct"],
+                "price_pct": h1h["price_pct"],
+                "price": h1h["price"],
+                "direction": primary["direction"],
+                "cum_delta": rt.cum_delta_usd,
+                "timeframe": "15m+1h",
+                "window_sec": h1h["window_sec"],
+                "pushover": True,
+                "pushover_priority": 2,
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "fingerprint": f"cdcombo:{pair_id}:{int(now // combo_cooldown)}",
+            }
+            rt.last_alert_ts["combo"] = now
+            rt.last_alert_ts["15m"] = now
+            rt.last_alert_ts["1h"] = now
+            await self.publisher.publish(alert)
+            logger.info(
+                "CD COMBO %s %s imb15=%.1f imb1h=%.1f price%%=%.2f",
+                meta["exchange"],
+                meta["symbol"],
+                h15["imbalance_pct"],
+                h1h["imbalance_pct"],
+                h1h["price_pct"],
+            )
+            # Still emit other TFs (30m, 4h, …) except 15m/1h
+            hits.pop("15m", None)
+            hits.pop("1h", None)
+
+        for tf, h in hits.items():
             alert = {
                 "type": "cd_spike",
                 "pair_id": pair_id,
                 "exchange": meta["exchange"],
                 "symbol": meta["symbol"],
                 "coin": meta["coin"],
-                "delta_window": delta_usd,
-                "window_sec": int(window),
+                "delta_window": h["delta_usd"],
+                "window_sec": h["window_sec"],
                 "timeframe": tf,
-                "imbalance_pct": imbalance_pct,
-                "direction": direction,
+                "imbalance_pct": h["imbalance_pct"],
+                "price_pct": h["price_pct"],
+                "price": h["price"],
+                "direction": h["direction"],
                 "cum_delta": rt.cum_delta_usd,
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "fingerprint": f"cd:{pair_id}:{tf}:{int(now // cooldown)}",
@@ -187,10 +285,11 @@ class CumDeltaEngine:
             rt.last_alert_ts[tf] = now
             await self.publisher.publish(alert)
             logger.info(
-                "CD spike %s %s tf=%s delta_usd=%.2f pct=%.2f",
+                "CD spike %s %s tf=%s delta$=%.2f imb=%.1f price%%=%.2f",
                 meta["exchange"],
                 meta["symbol"],
                 tf,
-                delta_usd,
-                imbalance_pct,
+                h["delta_usd"],
+                h["imbalance_pct"],
+                h["price_pct"],
             )

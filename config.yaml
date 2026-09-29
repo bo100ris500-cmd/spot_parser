@@ -6,11 +6,13 @@ big:
   threshold_from_most_liquid: true
 
 cd:
-  # Multi-TF imbalance alerts: |Δ| / volume >= alert_pct within each window
-  alert_pct: 20
+  # |Δ| / volume >= alert_pct within each window
+  alert_pct: 40
   cooldown_sec: 600
-  alert_timeframes: [5m, 15m, 1h, 4h, 1d]
-  # Keep short event history for largest TF (1d) + margin
+  combo_cooldown_sec: 600
+  combo_max_price_pct: 5
+  alert_timeframes: [15m, 30m, 1h, 4h, 12h, 24h]
+  # Keep history for largest TF (24h) + margin
   event_history_sec: 90000
 
 rsi:
