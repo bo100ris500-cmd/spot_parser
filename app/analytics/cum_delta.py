@@ -193,7 +193,7 @@ class CumDeltaEngine:
     ) -> bool:
         fill_ratio = float(self.config.get("cd", "min_window_fill_ratio", default=0.7))
         min_vol = float(self.config.get("cd", "min_volume_usd", default=2000))
-        min_abs_delta = float(self.config.get("cd", "min_abs_delta_usd", default=500))
+        min_abs_delta = float(self.config.get("cd", "min_abs_delta_usd", default=5000))
         min_trades = int(self.config.get("cd", "min_trades", default=15))
 
         # Need two full intervals of tracking

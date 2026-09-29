@@ -127,8 +127,13 @@ async def build_otchet_v2(coin: str, hub: "RuntimeHub") -> dict[str, Any]:
         track_start = min(starts) if starts else now
 
         tf_blocks: list[dict[str, Any]] = []
+        monitoring_age = now - track_start if starts else timedelta(0)
+
         for tf in timeframes:
             need = TF_DELTA[tf]
+            # Skip TF entirely if coin hasn't been monitored long enough
+            if monitoring_age < need:
+                continue
             since = now - need
             rows: list[dict[str, Any]] = []
             price_pcts: list[float] = []
@@ -147,7 +152,6 @@ async def build_otchet_v2(coin: str, hub: "RuntimeHub") -> dict[str, Any]:
                         if pc:
                             price_pct = pc[1]
                             price_pcts.append(price_pct)
-                    # else leave zeros — not enough history yet
                 rows.append(
                     {
                         "exchange": exchange,
@@ -160,14 +164,12 @@ async def build_otchet_v2(coin: str, hub: "RuntimeHub") -> dict[str, Any]:
                 )
             # Aggregate
             agg_delta = sum(r["delta_abs"] for r in rows)
-            # volume-weighted pct approx: average of non-zero pcts by abs delta weight
             weights = [abs(r["delta_abs"]) for r in rows]
             wsum = sum(weights)
             if wsum > 0:
                 agg_pct = sum(r["delta_pct"] * abs(r["delta_abs"]) for r in rows) / wsum
             else:
                 agg_pct = 0.0
-            # header price change: mean of available
             header_price_pct = sum(price_pcts) / len(price_pcts) if price_pcts else 0.0
             rows.sort(key=lambda r: abs(r["delta_abs"]), reverse=True)
             tf_blocks.append(
