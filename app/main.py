@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 
 from aiogram import Bot
+from aiogram.client.session.aiohttp import AiohttpSession
 
 from sqlalchemy import text
 
@@ -23,6 +24,13 @@ from app.services.runtime import RuntimeHub
 from app.utils.logging import get_logger, setup_logging
 
 logger = get_logger(__name__)
+
+# Fail fast when api.telegram.org is slow/unreachable (default aiogram = 60s)
+_TELEGRAM_TIMEOUT = 20.0
+
+
+def _make_bot(token: str) -> Bot:
+    return Bot(token=token, session=AiohttpSession(timeout=_TELEGRAM_TIMEOUT))
 
 
 async def init_db() -> None:
@@ -54,8 +62,11 @@ async def run() -> None:
     set_hub(hub)
     await hub.start()
 
-    bot = Bot(token=settings.bot_token)
-    await setup_bot_commands(bot)
+    bot = _make_bot(settings.bot_token)
+    try:
+        await asyncio.wait_for(setup_bot_commands(bot), timeout=_TELEGRAM_TIMEOUT)
+    except Exception as exc:
+        logger.warning("setup_bot_commands skipped: %s", exc)
     dp = create_dispatcher()
 
     outbox = init_outbox(
@@ -66,7 +77,7 @@ async def run() -> None:
 
     rsi_bot: Bot | None = None
     if settings.rsi_bot_token and settings.rsi_allowed_chat_id:
-        rsi_bot = Bot(token=settings.rsi_bot_token)
+        rsi_bot = _make_bot(settings.rsi_bot_token)
         set_rsi_bot(rsi_bot, settings.rsi_allowed_chat_id)
         logger.info("RSI alerts → separate bot chat_id=%s", settings.rsi_allowed_chat_id)
     else:

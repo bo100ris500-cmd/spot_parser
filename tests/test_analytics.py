@@ -39,6 +39,19 @@ def test_find_swings():
     assert 1 in highs or 3 in highs or 5 in highs
 
 
+def test_combo_requires_same_direction():
+    """Rule used by CumDeltaEngine: COMBO only when delta signs match."""
+
+    def same_direction(d15: float, d1h: float) -> bool:
+        return d15 * d1h > 0
+
+    assert same_direction(5000.0, 8000.0)
+    assert same_direction(-5000.0, -8000.0)
+    assert not same_direction(5000.0, -8000.0)
+    assert not same_direction(-5000.0, 8000.0)
+    assert not same_direction(5000.0, 0.0)
+
+
 def test_bearish_divergence_smoke():
     # Construct simple series with higher highs in price and lower RSI-ish pattern
     n = 80

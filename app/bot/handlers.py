@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import asyncio
+from typing import TYPE_CHECKING, Any
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -48,6 +50,7 @@ logger = get_logger(__name__)
 router = Router()
 
 _hub: "RuntimeHub | None" = None
+_TG_CALL_TIMEOUT = 20.0
 
 
 def set_hub(hub: "RuntimeHub") -> None:
@@ -78,10 +81,38 @@ def _html_pre(text: str) -> str:
     return f"<pre>{escaped}</pre>"
 
 
+async def _tg_call(coro: Any, *, what: str = "telegram") -> bool:
+    """Run a Telegram API call with short timeout; sync outbox pause on flood/network."""
+    from app.notify.telegram_outbox import get_outbox
+
+    outbox = get_outbox()
+    if outbox.is_blocked():
+        logger.warning("Skip %s: Telegram pause %ss left", what, outbox.seconds_remaining())
+        return False
+    try:
+        await asyncio.wait_for(coro, timeout=_TG_CALL_TIMEOUT)
+        outbox.note_success()
+        return True
+    except TelegramRetryAfter as exc:
+        outbox.block_for(float(exc.retry_after), reason="flood")
+        return False
+    except (TelegramNetworkError, asyncio.TimeoutError) as exc:
+        outbox.note_network_error()
+        logger.warning("Telegram %s failed: %s", what, exc)
+        return False
+    except Exception as exc:
+        logger.exception("Telegram %s error: %s", what, exc)
+        return False
+
+
+async def _reply(message: Message, text: str, **kwargs: Any) -> bool:
+    return await _tg_call(message.answer(text, **kwargs), what="reply")
+
+
 async def _answer_mono(message: Message, text: str) -> None:
     if len(text) > 3900:
         text = text[:3900] + "\n…"
-    await message.answer(_html_pre(text), parse_mode="HTML")
+    await _reply(message, _html_pre(text), parse_mode="HTML")
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +126,8 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         return
     await state.clear()
     exchanges = ", ".join(display_name(x) for x in ordered_enabled(list_supported_exchanges()))
-    await message.answer(
+    await _reply(
+        message,
         "Spot Parser бот готов.\n"
         "Команды:\n"
         "/check — проверить тикер на биржах\n"
@@ -105,7 +137,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "/cd — график кумулятивной дельты\n"
         "/otchet — текстовый отчёт\n"
         "/custom_cd — отчёт CD за период\n\n"
-        f"Биржи: {exchanges}"
+        f"Биржи: {exchanges}",
     )
 
 
@@ -118,7 +150,7 @@ async def cmd_list(message: Message, state: FSMContext) -> None:
         pairs = await get_hub().list_pairs()
         await _answer_mono(message, format_pair_list(pairs))
     except Exception as exc:
-        await message.answer(friendly_error(exc))
+        await _reply(message, friendly_error(exc))
 
 
 @router.message(Command("otchet"))
@@ -131,7 +163,7 @@ async def cmd_otchet(message: Message, state: FSMContext) -> None:
         await _send_otchet(message, parts[1].strip().split()[0])
         return
     await state.set_state(OtchetStates.waiting_ticker)
-    await message.answer("введите тикер")
+    await _reply(message, "введите тикер")
 
 
 @router.message(OtchetStates.waiting_ticker)
@@ -140,7 +172,7 @@ async def otchet_ticker(message: Message, state: FSMContext) -> None:
         return
     ticker = (message.text or "").strip()
     if not ticker or ticker.startswith("/"):
-        await message.answer("введите тикер")
+        await _reply(message, "введите тикер")
         return
     await state.clear()
     await _send_otchet(message, ticker.split()[0])
@@ -151,7 +183,7 @@ async def _send_otchet(message: Message, coin: str) -> None:
         data = await build_otchet_v2(coin, get_hub())
         await _answer_mono(message, format_otchet_mono(data))
     except Exception as exc:
-        await message.answer(friendly_error(exc))
+        await _reply(message, friendly_error(exc))
 
 
 @router.message(Command("custom_cd"))
@@ -164,13 +196,14 @@ async def cmd_custom_cd(message: Message, state: FSMContext) -> None:
         await state.update_data(coin=parts[1].strip().split()[0].upper())
         await state.set_state(CustomCdStates.waiting_period)
         now_s = format_dt(now_display())
-        await message.answer(
+        await _reply(
+            message,
             f"введите период\nТекущее время: {now_s}\n"
-            "Формат: 2026-09-08 20:00 - 2026-09-10 12:00 или 6h / 1d"
+            "Формат: 2026-09-08 20:00 - 2026-09-10 12:00 или 6h / 1d",
         )
         return
     await state.set_state(CustomCdStates.waiting_ticker)
-    await message.answer("введите тикер")
+    await _reply(message, "введите тикер")
 
 
 @router.message(CustomCdStates.waiting_ticker)
@@ -179,14 +212,15 @@ async def custom_cd_ticker(message: Message, state: FSMContext) -> None:
         return
     ticker = (message.text or "").strip()
     if not ticker or ticker.startswith("/"):
-        await message.answer("введите тикер")
+        await _reply(message, "введите тикер")
         return
     await state.update_data(coin=ticker.split()[0].upper())
     await state.set_state(CustomCdStates.waiting_period)
     now_s = format_dt(now_display())
-    await message.answer(
+    await _reply(
+        message,
         f"введите период\nТекущее время: {now_s}\n"
-        "Формат: 2026-09-08 20:00 - 2026-09-10 12:00 или 6h / 1d"
+        "Формат: 2026-09-08 20:00 - 2026-09-10 12:00 или 6h / 1d",
     )
 
 
@@ -198,7 +232,7 @@ async def custom_cd_period(message: Message, state: FSMContext) -> None:
     coin = data.get("coin")
     if not coin:
         await state.clear()
-        await message.answer("Сессия сброшена. Начните снова: /custom_cd")
+        await _reply(message, "Сессия сброшена. Начните снова: /custom_cd")
         return
     try:
         from datetime import datetime, timezone
@@ -217,7 +251,7 @@ async def custom_cd_period(message: Message, state: FSMContext) -> None:
         await state.clear()
         await _answer_mono(message, format_custom_cd_mono(report))
     except Exception as exc:
-        await message.answer(friendly_error(exc))
+        await _reply(message, friendly_error(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +269,7 @@ async def cmd_check(message: Message, state: FSMContext) -> None:
         await _run_check(message, parts[1].strip())
         return
     await state.set_state(CheckStates.waiting_ticker)
-    await message.answer("введите тикер")
+    await _reply(message, "введите тикер")
 
 
 @router.message(CheckStates.waiting_ticker)
@@ -244,7 +278,7 @@ async def check_ticker_entered(message: Message, state: FSMContext) -> None:
         return
     ticker = (message.text or "").strip()
     if not ticker or ticker.startswith("/"):
-        await message.answer("введите тикер")
+        await _reply(message, "введите тикер")
         return
     await state.clear()
     await _run_check(message, ticker)
@@ -253,19 +287,19 @@ async def check_ticker_entered(message: Message, state: FSMContext) -> None:
 async def _run_check(message: Message, ticker: str) -> None:
     coin = ticker.split()[0].upper()
     try:
-        await message.answer(f"Ищу {coin} на биржах…")
+        await _reply(message, f"Ищу {coin} на биржах…")
         rows = await get_hub().check_volumes(coin)
         text = format_check_table(coin, rows)
         if not rows:
             await _answer_mono(message, text)
             return
-        await message.answer(
+        await _reply(message, 
             _html_pre(text),
             parse_mode="HTML",
             reply_markup=check_actions_keyboard(coin),
         )
     except Exception as exc:
-        await message.answer(friendly_error(exc))
+        await _reply(message, friendly_error(exc))
 
 
 @router.callback_query(F.data.startswith("check:"))
@@ -281,25 +315,25 @@ async def check_action(callback: CallbackQuery, state: FSMContext) -> None:
     try:
         rows = await hub.check_volumes(coin)
         if not rows:
-            await callback.message.answer(f"Токен {coin} не найден на биржах.")
+            await _reply(callback.message, f"Токен {coin} не найден на биржах.")
             return
         added: list[str] = []
         if action == "big":
             for r in rows:
                 pair = await hub.add_or_update_pair(coin, r["exchange"], flag_big=True)
                 added.append(display_name(pair.exchange))
-            await callback.message.answer(
+            await _reply(callback.message, 
                 f"{coin} {' '.join(added)} [big] успешно добавлен"
             )
         elif action == "cd":
             for r in rows:
                 pair = await hub.add_or_update_pair(coin, r["exchange"], flag_cd=True)
                 added.append(display_name(pair.exchange))
-            await callback.message.answer(
+            await _reply(callback.message, 
                 f"{coin} {' '.join(added)} [cd] успешно добавлен"
             )
     except Exception as exc:
-        await callback.message.answer(friendly_error(exc))
+        await _reply(callback.message, friendly_error(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -318,17 +352,17 @@ async def cmd_add(message: Message, state: FSMContext) -> None:
         try:
             coin, exchanges = parse_ticker_exchanges(parts[1])
         except Exception as exc:
-            await message.answer(friendly_error(exc))
+            await _reply(message, friendly_error(exc))
             return
         await state.set_state(AddStates.choosing_flags)
         await state.update_data(coin=coin, exchanges=exchanges, flag_big=False, flag_cd=False)
-        await message.answer(
+        await _reply(message, 
             "выберите действия отслеживания",
             reply_markup=flags_keyboard(big_on=False, cd_on=False),
         )
         return
     await state.set_state(AddStates.waiting_ticker_exchanges)
-    await message.answer("Введите тикер и биржу")
+    await _reply(message, "Введите тикер и биржу")
 
 
 @router.message(AddStates.waiting_ticker_exchanges)
@@ -338,11 +372,11 @@ async def add_ticker_exchanges(message: Message, state: FSMContext) -> None:
     try:
         coin, exchanges = parse_ticker_exchanges(message.text or "")
     except Exception as exc:
-        await message.answer(friendly_error(exc))
+        await _reply(message, friendly_error(exc))
         return
     await state.set_state(AddStates.choosing_flags)
     await state.update_data(coin=coin, exchanges=exchanges, flag_big=False, flag_cd=False)
-    await message.answer(
+    await _reply(message, 
         "выберите действия отслеживания",
         reply_markup=flags_keyboard(big_on=False, cd_on=False),
     )
@@ -401,11 +435,11 @@ async def add_flags_callback(callback: CallbackQuery, state: FSMContext) -> None
             flags.append("cd")
         flag_s = " ".join(f"[{f}]" for f in flags)
         if ok_exchanges:
-            await callback.message.answer(
+            await _reply(callback.message, 
                 f"{coin} {' '.join(ok_exchanges)} {flag_s} успешно добавлен"
             )
         if errors:
-            await callback.message.answer("Не удалось:\n" + "\n".join(errors))
+            await _reply(callback.message, "Не удалось:\n" + "\n".join(errors))
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
         except Exception:
@@ -427,15 +461,15 @@ async def cmd_remove(message: Message, state: FSMContext) -> None:
         pairs = await get_hub().list_pairs()
         coins = sorted({p.coin for p in pairs})
         if not coins:
-            await message.answer("Список пуст — удалять нечего.")
+            await _reply(message, "Список пуст — удалять нечего.")
             return
         await state.set_state(RemoveStates.choosing_coin)
-        await message.answer(
+        await _reply(message, 
             "Выберите монету для удаления:",
             reply_markup=coins_keyboard(coins, "rmcoin"),
         )
     except Exception as exc:
-        await message.answer(friendly_error(exc))
+        await _reply(message, friendly_error(exc))
 
 
 @router.callback_query(F.data.startswith("rmcoin:"))
@@ -514,7 +548,7 @@ async def remove_action(callback: CallbackQuery, state: FSMContext) -> None:
             )
     except Exception as exc:
         await state.clear()
-        await callback.message.answer(friendly_error(exc))
+        await _reply(callback.message, friendly_error(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -530,15 +564,15 @@ async def cmd_cd(message: Message, state: FSMContext) -> None:
     try:
         coins = await get_hub().list_coins_with_flag(flag_cd=True)
         if not coins:
-            await message.answer("Нет пар с отслеживанием кумулятивной дельты. Добавьте через /add или /check.")
+            await _reply(message, "Нет пар с отслеживанием кумулятивной дельты. Добавьте через /add или /check.")
             return
         await state.set_state(CdStates.choosing_coin)
-        await message.answer(
+        await _reply(message, 
             "Выберите монету:",
             reply_markup=coins_keyboard(coins, "cdcoin"),
         )
     except Exception as exc:
-        await message.answer(friendly_error(exc))
+        await _reply(message, friendly_error(exc))
 
 
 @router.callback_query(F.data.startswith("cdcoin:"))
@@ -632,7 +666,7 @@ async def _send_cd_chart(message: Message, state: FSMContext, interval_text: str
     timeframe = data.get("timeframe")
     if not coin or not timeframe:
         await state.clear()
-        await message.answer("Сессия сброшена. Начните снова: /cd")
+        await _reply(message, "Сессия сброшена. Начните снова: /cd")
         return
     try:
         # Need observation start for interval parsing defaults
@@ -652,12 +686,15 @@ async def _send_cd_chart(message: Message, state: FSMContext, interval_text: str
         )
         png = render_cd_chart_png(series)
         await state.clear()
-        await message.answer_photo(
-            BufferedInputFile(png, filename=f"{coin}_{timeframe}.png"),
-            caption=f"{series['title']}\n{series['subtitle']}",
+        await _tg_call(
+            message.answer_photo(
+                BufferedInputFile(png, filename=f"{coin}_{timeframe}.png"),
+                caption=f"{series['title']}\n{series['subtitle']}",
+            ),
+            what="photo",
         )
     except Exception as exc:
-        await message.answer(friendly_error(exc))
+        await _reply(message, friendly_error(exc))
 
 
 # ---------------------------------------------------------------------------

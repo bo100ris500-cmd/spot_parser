@@ -23,6 +23,8 @@ cd:
   min_window_fill_ratio: 0.7
   # Need ~2x largest TF of history (prev + current)
   event_history_sec: 180000
+  # Hard RAM guard: drop oldest events if a pair exceeds this count
+  max_events_per_pair: 150000
 
 rsi:
   period: 14
@@ -47,6 +49,8 @@ telegram:
   # Min pause between outbound Telegram messages (anti-flood)
   min_interval_sec: 1.5
   max_queue: 80
+  # HTTP timeout for Telegram API calls (seconds)
+  request_timeout_sec: 20
 
 reconnect:
   base_delay: 2.0

@@ -257,6 +257,10 @@ class CumDeltaEngine:
         cutoff = now - hist
         while rt.events and rt.events[0][0] < cutoff:
             rt.events.popleft()
+        # Hard cap: prevent unbounded RAM on hyper-liquid pairs
+        max_events = int(self.config.get("cd", "max_events_per_pair", default=150000))
+        while len(rt.events) > max_events:
+            rt.events.popleft()
 
         bucket_sec = int(self.config.get("bucket", "seconds", default=60))
         start = int(trade_ts // bucket_sec) * bucket_sec
@@ -328,12 +332,14 @@ class CumDeltaEngine:
             and now - rt.last_alert_ts.get("combo", 0.0) >= combo_cooldown
         ):
             h15, h1h = hits["15m"], hits["1h"]
+            # Opposite-sign deltas (buy on one TF, sell on the other) are not a COMBO
+            same_direction = h15["delta_usd"] * h1h["delta_usd"] > 0
             same_sample = (
                 abs(h15["delta_usd"] - h1h["delta_usd"]) < 1e-6
                 and abs(h15["vol_prev"] - h1h["vol_prev"]) < 1e-6
             )
             h1h_mature = h1h["span_sec"] >= 45 * 60
-            if not same_sample and h1h_mature:
+            if same_direction and not same_sample and h1h_mature:
                 combo_ready = True
 
         if combo_ready:
