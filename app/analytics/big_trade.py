@@ -50,6 +50,8 @@ class BigTradeDetector:
         self._seen_ids: dict[int, set[str]] = defaultdict(set)
         self._pending: dict[tuple[int, str], _AggPending] = {}
         self._meta: dict[int, dict[str, Any]] = {}
+        # coin -> (ts, preferred_exchange)
+        self._preferred_cache: dict[str, tuple[float, str | None]] = {}
 
     def set_pair_meta(
         self,
@@ -68,6 +70,7 @@ class BigTradeDetector:
             "enabled": enabled,
             "threshold_usd": threshold_usd,
         }
+        self._preferred_cache.pop(coin.upper(), None)
         if not enabled:
             self._pending.pop((pair_id, "buy"), None)
             self._pending.pop((pair_id, "sell"), None)
@@ -93,6 +96,32 @@ class BigTradeDetector:
                     return pid
         return candidates[0]
 
+    async def _preferred_exchange(self, coin: str) -> str | None:
+        """Cached most-liquid venue; avoids DB/REST on every trade."""
+        coin = coin.upper()
+        ttl = float(self.config.get("big", "most_liquid_cache_sec", default=60))
+        now = time.time()
+        cached = self._preferred_cache.get(coin)
+        if cached and now - cached[0] < ttl:
+            return cached[1]
+        preferred: str | None = None
+        if self._most_liquid_exchange is not None:
+            try:
+                preferred = await self._most_liquid_exchange(coin)
+            except Exception as exc:
+                from app.utils.logging import format_exc_detail, warn_throttled
+
+                warn_throttled(
+                    logger,
+                    f"most-liquid:{coin}",
+                    "most-liquid lookup failed for %s: %s",
+                    coin,
+                    format_exc_detail(exc),
+                    interval_sec=60.0,
+                )
+        self._preferred_cache[coin] = (now, preferred)
+        return preferred
+
     async def _shared_threshold(self, coin: str, fallback_cost: float) -> float:
         """Threshold from most liquid big-watched exchange for this coin."""
         window_min = float(self.config.get("big", "window_minutes", default=60))
@@ -100,11 +129,8 @@ class BigTradeDetector:
 
         preferred: str | None = None
         use_liq = bool(self.config.get("big", "threshold_from_most_liquid", default=True))
-        if use_liq and self._most_liquid_exchange is not None:
-            try:
-                preferred = await self._most_liquid_exchange(coin)
-            except Exception as exc:
-                logger.warning("most-liquid lookup failed for %s: %s", coin, exc)
+        if use_liq:
+            preferred = await self._preferred_exchange(coin)
 
         ref_pid = self._ref_pair_id(coin, preferred)
         if ref_pid is None:

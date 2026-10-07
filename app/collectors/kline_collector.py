@@ -145,12 +145,17 @@ class KlineCollector:
                             exc,
                         )
                         break
-                    logger.warning(
+                    from app.utils.logging import format_exc_detail, warn_throttled
+
+                    warn_throttled(
+                        logger,
+                        f"kline:{pair.exchange}:{pair.symbol}:{tf}",
                         "Kline sync failed %s %s %s: %s",
                         pair.exchange,
                         pair.symbol,
                         tf,
-                        exc,
+                        format_exc_detail(exc),
+                        interval_sec=120.0,
                     )
 
     async def _sync_pair_tf(

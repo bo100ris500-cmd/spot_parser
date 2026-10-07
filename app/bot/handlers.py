@@ -50,7 +50,7 @@ logger = get_logger(__name__)
 router = Router()
 
 _hub: "RuntimeHub | None" = None
-_TG_CALL_TIMEOUT = 20.0
+_TG_CALL_TIMEOUT = 35.0
 
 
 def set_hub(hub: "RuntimeHub") -> None:

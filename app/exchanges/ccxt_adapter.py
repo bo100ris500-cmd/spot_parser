@@ -175,16 +175,36 @@ class CcxtExchangeAdapter:
         try:
             rows = await self._exchange.fetch_trades(symbol, since=since_ms, limit=limit)
         except Exception as exc:
-            logger.warning("fetch_trades failed %s %s: %s", self.name, symbol, exc)
+            from app.utils.logging import format_exc_detail, warn_throttled
+
+            warn_throttled(
+                logger,
+                f"trades:{self.name}:{symbol}",
+                "fetch_trades failed %s %s: %s",
+                self.name,
+                symbol,
+                format_exc_detail(exc),
+                interval_sec=120.0,
+            )
             return []
         return [self._to_normalized_trade(t, symbol) for t in rows]
 
     async def fetch_quote_volume(self, symbol: str) -> float | None:
+        from app.utils.logging import format_exc_detail, warn_throttled
+
         await self.load_markets()
         try:
             ticker = await self._exchange.fetch_ticker(symbol)
         except Exception as exc:
-            logger.warning("fetch_ticker failed %s %s: %s", self.name, symbol, exc)
+            warn_throttled(
+                logger,
+                f"ticker:{self.name}:{symbol}",
+                "fetch_ticker failed %s %s: %s",
+                self.name,
+                symbol,
+                format_exc_detail(exc),
+                interval_sec=120.0,
+            )
             return None
         for key in ("quoteVolume", "baseVolume"):
             val = ticker.get(key)

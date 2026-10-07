@@ -41,6 +41,8 @@ class RuntimeHub:
         self._lock = asyncio.Lock()
         # coin -> [(exchange, volume), ...] sorted desc; refreshed periodically
         self._liquidity_cache: dict[str, tuple[float, list[tuple[str, float]]]] = {}
+        self._liquidity_locks: dict[str, asyncio.Lock] = {}
+        self._most_liquid_cache: dict[str, tuple[float, str | None]] = {}
         self._paused_pairs: set[int] = set()
 
     async def start(self) -> None:
@@ -145,56 +147,71 @@ class RuntimeHub:
     async def rank_liquidity(self, coin: str, *, force: bool = False) -> list[tuple[str, float]]:
         """Return [(exchange, quote_volume)] for coin across adapters, desc."""
         coin = coin.upper().strip()
-        now = asyncio.get_event_loop().time()
-        cached = self._liquidity_cache.get(coin)
-        if cached and not force and now - cached[0] < 300:
-            return cached[1]
+        ttl = float(self.config.get("big", "liquidity_cache_sec", default=300))
+        lock = self._liquidity_locks.setdefault(coin, asyncio.Lock())
+        async with lock:
+            now = asyncio.get_event_loop().time()
+            cached = self._liquidity_cache.get(coin)
+            if cached and not force and now - cached[0] < ttl:
+                return cached[1]
 
-        rows: list[tuple[str, float]] = []
+            rows: list[tuple[str, float]] = []
 
-        async def _one(name: str, adapter: CcxtExchangeAdapter) -> tuple[str, float] | None:
-            try:
-                symbol = adapter.resolve_symbol(coin)
-                if not symbol:
+            async def _one(name: str, adapter: CcxtExchangeAdapter) -> tuple[str, float] | None:
+                try:
+                    symbol = adapter.resolve_symbol(coin)
+                    if not symbol:
+                        return None
+                    vol = await adapter.fetch_quote_volume(symbol)
+                    return (name, float(vol or 0.0))
+                except Exception:
                     return None
-                vol = await adapter.fetch_quote_volume(symbol)
-                return (name, float(vol or 0.0))
-            except Exception:
-                return None
 
-        results = await asyncio.gather(
-            *[_one(n, a) for n, a in self.adapters.items()], return_exceptions=True
-        )
-        for item in results:
-            if isinstance(item, tuple):
-                rows.append(item)
-        rows.sort(key=lambda x: x[1], reverse=True)
-        self._liquidity_cache[coin] = (now, rows)
-        return rows
+            results = await asyncio.gather(
+                *[_one(n, a) for n, a in self.adapters.items()], return_exceptions=True
+            )
+            for item in results:
+                if isinstance(item, tuple):
+                    rows.append(item)
+            rows.sort(key=lambda x: x[1], reverse=True)
+            self._liquidity_cache[coin] = (now, rows)
+            return rows
 
     async def top_liquid_exchanges(self, coin: str, n: int = 3) -> list[str]:
         ranked = await self.rank_liquidity(coin)
         return [ex for ex, _ in ranked[:n] if _ > 0] or [ex for ex, _ in ranked[:n]]
 
     async def most_liquid_big_exchange(self, coin: str) -> str | None:
-        """Most liquid exchange among watched pairs with flag_big for this coin."""
-        factory = get_session_factory()
-        async with factory() as session:
-            result = await session.execute(
-                select(WatchedPair).where(
-                    WatchedPair.coin == coin.upper(),
-                    WatchedPair.flag_big.is_(True),
-                )
-            )
-            pairs = list(result.scalars().all())
-        if not pairs:
+        """
+        Most liquid exchange among watched pairs with flag_big for this coin.
+        Uses in-memory big._meta (no DB) + cached liquidity ranks — safe on hot trade path.
+        """
+        coin = coin.upper().strip()
+        ttl = float(self.config.get("big", "most_liquid_cache_sec", default=60))
+        now = asyncio.get_event_loop().time()
+        cached = self._most_liquid_cache.get(coin)
+        if cached and now - cached[0] < ttl:
+            return cached[1]
+
+        watched = {
+            m["exchange"]
+            for m in self.big._meta.values()
+            if m.get("enabled") and m.get("coin") == coin
+        }
+        if not watched:
+            self._most_liquid_cache[coin] = (now, None)
             return None
-        watched = {p.exchange for p in pairs}
+
         ranked = await self.rank_liquidity(coin)
+        chosen: str | None = None
         for ex, _vol in ranked:
             if ex in watched:
-                return ex
-        return pairs[0].exchange
+                chosen = ex
+                break
+        if chosen is None:
+            chosen = next(iter(watched))
+        self._most_liquid_cache[coin] = (now, chosen)
+        return chosen
 
     async def is_most_liquid_big(self, coin: str, exchange: str) -> bool:
         """Kept for compatibility; prefer most_liquid_big_exchange."""

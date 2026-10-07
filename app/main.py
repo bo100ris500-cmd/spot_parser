@@ -25,12 +25,8 @@ from app.utils.logging import get_logger, setup_logging
 
 logger = get_logger(__name__)
 
-# Fail fast when api.telegram.org is slow/unreachable (default aiogram = 60s)
-_TELEGRAM_TIMEOUT = 20.0
-
-
-def _make_bot(token: str) -> Bot:
-    return Bot(token=token, session=AiohttpSession(timeout=_TELEGRAM_TIMEOUT))
+def _make_bot(token: str, timeout: float = 35.0) -> Bot:
+    return Bot(token=token, session=AiohttpSession(timeout=timeout))
 
 
 async def init_db() -> None:
@@ -62,9 +58,10 @@ async def run() -> None:
     set_hub(hub)
     await hub.start()
 
-    bot = _make_bot(settings.bot_token)
+    tg_timeout = float(config.get("telegram", "request_timeout_sec", default=35))
+    bot = _make_bot(settings.bot_token, timeout=tg_timeout)
     try:
-        await asyncio.wait_for(setup_bot_commands(bot), timeout=_TELEGRAM_TIMEOUT)
+        await asyncio.wait_for(setup_bot_commands(bot), timeout=tg_timeout)
     except Exception as exc:
         logger.warning("setup_bot_commands skipped: %s", exc)
     dp = create_dispatcher()
@@ -72,12 +69,13 @@ async def run() -> None:
     outbox = init_outbox(
         min_interval_sec=float(config.get("telegram", "min_interval_sec", default=1.5)),
         max_queue=int(config.get("telegram", "max_queue", default=80)),
+        send_timeout_sec=tg_timeout,
     )
     outbox.start()
 
     rsi_bot: Bot | None = None
     if settings.rsi_bot_token and settings.rsi_allowed_chat_id:
-        rsi_bot = _make_bot(settings.rsi_bot_token)
+        rsi_bot = _make_bot(settings.rsi_bot_token, timeout=tg_timeout)
         set_rsi_bot(rsi_bot, settings.rsi_allowed_chat_id)
         logger.info("RSI alerts → separate bot chat_id=%s", settings.rsi_allowed_chat_id)
     else:

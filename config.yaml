@@ -4,6 +4,9 @@ big:
   aggregate_ms: 1500
   # Shared USD threshold from the most liquid watched exchange; alerts on ALL venues
   threshold_from_most_liquid: true
+  # Cache most-liquid venue / REST ranks (hot path safety)
+  most_liquid_cache_sec: 60
+  liquidity_cache_sec: 300
 
 cd:
   # |Δ_current| / volume_PREVIOUS_interval >= alert_pct
@@ -50,7 +53,7 @@ telegram:
   min_interval_sec: 1.5
   max_queue: 80
   # HTTP timeout for Telegram API calls (seconds)
-  request_timeout_sec: 20
+  request_timeout_sec: 35
 
 reconnect:
   base_delay: 2.0
@@ -72,3 +75,9 @@ exchanges:
     - hyperliquid
     - coinbase
     - lbank
+
+database:
+  pool_size: 20
+  max_overflow: 30
+  pool_timeout: 30
+  pool_recycle: 1800

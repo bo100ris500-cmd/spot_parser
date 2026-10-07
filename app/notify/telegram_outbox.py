@@ -20,8 +20,7 @@ PRIO_RSI = 2
 PRIO_CD = 3
 PRIO_OTHER = 5
 
-# Cap how long a single Telegram HTTP call may block the outbox worker
-_SEND_TIMEOUT_SEC = 20.0
+_SEND_TIMEOUT_SEC = 35.0
 _NETWORK_BACKOFF_BASE = 15.0
 _NETWORK_BACKOFF_MAX = 300.0
 
@@ -47,9 +46,11 @@ class TelegramOutbox:
         *,
         min_interval_sec: float = 1.5,
         max_queue: int = 80,
+        send_timeout_sec: float = _SEND_TIMEOUT_SEC,
     ) -> None:
         self.min_interval_sec = min_interval_sec
         self.max_queue = max_queue
+        self.send_timeout_sec = float(send_timeout_sec)
         self._queue: asyncio.PriorityQueue[_QueuedMessage] = asyncio.PriorityQueue()
         self._seq = 0
         self._blocked_until = 0.0
@@ -163,7 +164,7 @@ class TelegramOutbox:
         try:
             await asyncio.wait_for(
                 bot.send_message(chat_id, text, **kwargs),
-                timeout=_SEND_TIMEOUT_SEC,
+                timeout=self.send_timeout_sec,
             )
             self.note_success()
             return True
@@ -186,7 +187,7 @@ class TelegramOutbox:
             "Telegram outbox started (min_interval=%.1fs, max_queue=%s, send_timeout=%.0fs)",
             self.min_interval_sec,
             self.max_queue,
-            _SEND_TIMEOUT_SEC,
+            self.send_timeout_sec,
         )
         while not self._stop.is_set():
             try:
@@ -211,7 +212,7 @@ class TelegramOutbox:
                     continue
 
             try:
-                await asyncio.wait_for(self._emit(item), timeout=_SEND_TIMEOUT_SEC)
+                await asyncio.wait_for(self._emit(item), timeout=self.send_timeout_sec)
                 self.note_success()
             except TelegramRetryAfter as exc:
                 self.block_for(float(exc.retry_after), reason="flood")
@@ -247,7 +248,16 @@ def get_outbox() -> TelegramOutbox:
     return _outbox
 
 
-def init_outbox(*, min_interval_sec: float = 1.5, max_queue: int = 80) -> TelegramOutbox:
+def init_outbox(
+    *,
+    min_interval_sec: float = 1.5,
+    max_queue: int = 80,
+    send_timeout_sec: float = _SEND_TIMEOUT_SEC,
+) -> TelegramOutbox:
     global _outbox
-    _outbox = TelegramOutbox(min_interval_sec=min_interval_sec, max_queue=max_queue)
+    _outbox = TelegramOutbox(
+        min_interval_sec=min_interval_sec,
+        max_queue=max_queue,
+        send_timeout_sec=send_timeout_sec,
+    )
     return _outbox
