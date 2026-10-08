@@ -68,7 +68,7 @@ async def run() -> None:
 
     outbox = init_outbox(
         min_interval_sec=float(config.get("telegram", "min_interval_sec", default=1.5)),
-        max_queue=int(config.get("telegram", "max_queue", default=80)),
+        max_queue=int(config.get("telegram", "max_queue", default=200)),
         send_timeout_sec=tg_timeout,
     )
     outbox.start()

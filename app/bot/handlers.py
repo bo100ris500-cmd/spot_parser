@@ -82,12 +82,17 @@ def _html_pre(text: str) -> str:
 
 
 async def _tg_call(coro: Any, *, what: str = "telegram") -> bool:
-    """Run a Telegram API call with short timeout; sync outbox pause on flood/network."""
+    """Run a Telegram API call with short timeout; skip only on flood ban."""
     from app.notify.telegram_outbox import get_outbox
 
     outbox = get_outbox()
-    if outbox.is_blocked():
-        logger.warning("Skip %s: Telegram pause %ss left", what, outbox.seconds_remaining())
+    # Network blips must not block interactive replies — only real flood bans
+    if outbox.is_flood_blocked():
+        logger.warning(
+            "Skip %s: Telegram flood pause %ss left",
+            what,
+            outbox.flood_seconds_remaining(),
+        )
         return False
     try:
         await asyncio.wait_for(coro, timeout=_TG_CALL_TIMEOUT)
@@ -98,7 +103,7 @@ async def _tg_call(coro: Any, *, what: str = "telegram") -> bool:
         return False
     except (TelegramNetworkError, asyncio.TimeoutError) as exc:
         outbox.note_network_error()
-        logger.warning("Telegram %s failed: %s", what, exc)
+        logger.warning("Telegram %s failed: %s", what, exc or type(exc).__name__)
         return False
     except Exception as exc:
         logger.exception("Telegram %s error: %s", what, exc)

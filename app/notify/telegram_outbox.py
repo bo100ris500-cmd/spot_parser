@@ -21,8 +21,8 @@ PRIO_CD = 3
 PRIO_OTHER = 5
 
 _SEND_TIMEOUT_SEC = 35.0
-_NETWORK_BACKOFF_BASE = 15.0
-_NETWORK_BACKOFF_MAX = 300.0
+_NETWORK_BACKOFF_BASE = 8.0
+_NETWORK_BACKOFF_MAX = 45.0  # keep short — long mutes silently kill all alerts
 
 
 @dataclass(order=True)
@@ -33,19 +33,23 @@ class _QueuedMessage:
     chat_id: int = field(compare=False)
     text: str = field(compare=False)
     kwargs: dict[str, Any] = field(default_factory=dict, compare=False)
+    attempts: int = field(default=0, compare=False)
 
 
 class TelegramOutbox:
     """
-    Serializes Telegram sends with rate-limit, flood-control and network backoff.
-    Prevents RetryAfter storms and long hangs when api.telegram.org is unreachable.
+    Serializes Telegram sends.
+
+    Flood (RetryAfter) and network timeouts are tracked separately:
+    - flood: may drop CD spam for long bans
+    - network: short backoff only; never drop BIG/COMBO at the door
     """
 
     def __init__(
         self,
         *,
         min_interval_sec: float = 1.5,
-        max_queue: int = 80,
+        max_queue: int = 200,
         send_timeout_sec: float = _SEND_TIMEOUT_SEC,
     ) -> None:
         self.min_interval_sec = min_interval_sec
@@ -53,50 +57,75 @@ class TelegramOutbox:
         self.send_timeout_sec = float(send_timeout_sec)
         self._queue: asyncio.PriorityQueue[_QueuedMessage] = asyncio.PriorityQueue()
         self._seq = 0
-        self._blocked_until = 0.0
+        self._flood_until = 0.0
+        self._network_until = 0.0
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._last_flood_log = 0.0
         self._last_net_log = 0.0
         self._dropped = 0
+        self._sent = 0
         self._network_backoff = _NETWORK_BACKOFF_BASE
 
     @property
     def blocked_until(self) -> float:
-        return self._blocked_until
+        return max(self._flood_until, self._network_until)
+
+    def is_flood_blocked(self) -> bool:
+        return time.time() < self._flood_until
+
+    def is_network_paused(self) -> bool:
+        return time.time() < self._network_until
 
     def is_blocked(self) -> bool:
-        return time.time() < self._blocked_until
+        """True if any outbound pause is active (compat)."""
+        return self.is_flood_blocked() or self.is_network_paused()
 
     def seconds_remaining(self) -> int:
-        return max(0, int(self._blocked_until - time.time()))
+        return max(0, int(self.blocked_until - time.time()))
+
+    def flood_seconds_remaining(self) -> int:
+        return max(0, int(self._flood_until - time.time()))
 
     def block_for(self, seconds: float, *, reason: str = "flood") -> None:
         until = time.time() + max(0.0, float(seconds))
-        if until > self._blocked_until:
-            self._blocked_until = until
-            logger.error(
-                "Telegram pause (%s): %ss (~%.1fh)",
-                reason,
-                int(seconds),
-                float(seconds) / 3600.0,
-            )
+        if reason == "flood":
+            if until > self._flood_until:
+                self._flood_until = until
+                logger.error(
+                    "Telegram pause (flood): %ss (~%.1fh)",
+                    int(seconds),
+                    float(seconds) / 3600.0,
+                )
+        else:
+            if until > self._network_until:
+                self._network_until = until
+                logger.warning(
+                    "Telegram pause (network): %ss",
+                    int(seconds),
+                )
 
     def note_network_error(self) -> None:
-        """Back off after timeouts so we do not pile 20s hangs forever."""
+        """Short backoff after timeouts — do not silence the bot for minutes."""
         self.block_for(self._network_backoff, reason="network")
-        self._network_backoff = min(self._network_backoff * 2.0, _NETWORK_BACKOFF_MAX)
+        self._network_backoff = min(self._network_backoff * 1.5, _NETWORK_BACKOFF_MAX)
         now = time.time()
         if now - self._last_net_log > 60:
             self._last_net_log = now
             logger.warning(
-                "Telegram network issues — outbound muted %ss (next backoff up to %.0fs)",
+                "Telegram network issues — send backoff %ss (next up to %.0fs); "
+                "queue=%s dropped=%s sent=%s",
                 self.seconds_remaining(),
                 self._network_backoff,
+                self._queue.qsize(),
+                self._dropped,
+                self._sent,
             )
 
     def note_success(self) -> None:
         self._network_backoff = _NETWORK_BACKOFF_BASE
+        self._network_until = 0.0
+        self._sent += 1
 
     def start(self) -> None:
         self._stop.clear()
@@ -113,6 +142,19 @@ class TelegramOutbox:
                 pass
             self._task = None
 
+    def _drop(self, reason: str, *, priority: int) -> None:
+        self._dropped += 1
+        if self._dropped % 25 == 1:
+            logger.warning(
+                "Telegram drop (%s) prio=%s queue=%s dropped=%s flood=%ss net=%ss",
+                reason,
+                priority,
+                self._queue.qsize(),
+                self._dropped,
+                self.flood_seconds_remaining(),
+                max(0, int(self._network_until - time.time())),
+            )
+
     async def send(
         self,
         bot: Bot,
@@ -124,21 +166,17 @@ class TelegramOutbox:
         **kwargs: Any,
     ) -> bool:
         """Enqueue a message. Returns False if dropped."""
-        if drop_if_blocked and self.is_blocked():
-            if self.seconds_remaining() > 120:
-                self._dropped += 1
-                if self._dropped % 50 == 1:
-                    logger.warning(
-                        "Telegram muted %ss left — dropping alerts (dropped=%s)",
-                        self.seconds_remaining(),
-                        self._dropped,
-                    )
+        # Only hard-drop on long FLOOD bans (not network blips)
+        if drop_if_blocked and self.is_flood_blocked() and self.flood_seconds_remaining() > 120:
+            if priority >= PRIO_CD:
+                self._drop("flood", priority=priority)
                 return False
 
         if self._queue.qsize() >= self.max_queue:
             if priority >= PRIO_CD:
-                self._dropped += 1
+                self._drop("queue_full", priority=priority)
                 return False
+            # High-priority: still enqueue (queue may grow a bit)
 
         self._seq += 1
         await self._queue.put(
@@ -154,11 +192,11 @@ class TelegramOutbox:
         return True
 
     async def send_now_safe(self, bot: Bot, chat_id: int, text: str, **kwargs: Any) -> bool:
-        """Immediate send for command replies. Honours pause; does not enqueue."""
-        if self.is_blocked():
+        """Immediate send for command replies. Honours flood pause only."""
+        if self.is_flood_blocked():
             logger.warning(
-                "Cannot reply: Telegram pause %ss remaining",
-                self.seconds_remaining(),
+                "Cannot reply: Telegram flood pause %ss remaining",
+                self.flood_seconds_remaining(),
             )
             return False
         try:
@@ -173,7 +211,7 @@ class TelegramOutbox:
             return False
         except (TelegramNetworkError, asyncio.TimeoutError) as exc:
             self.note_network_error()
-            logger.warning("Telegram send_now failed: %s", exc)
+            logger.warning("Telegram send_now failed: %s", exc or type(exc).__name__)
             return False
         except Exception as exc:
             logger.exception("Telegram send failed: %s", exc)
@@ -198,16 +236,16 @@ class TelegramOutbox:
                 raise
 
             now = time.time()
-            if now < self._blocked_until:
-                remaining = self._blocked_until - now
-                if remaining > 120 and item.priority >= PRIO_CD:
-                    self._dropped += 1
-                    continue
-                await asyncio.sleep(min(remaining, 30.0))
-                if time.time() < self._blocked_until and item.priority >= PRIO_CD:
-                    self._dropped += 1
-                    continue
-                if time.time() < self._blocked_until:
+            wait_until = max(self._flood_until, self._network_until)
+            if now < wait_until:
+                remaining = wait_until - now
+                # During long flood only: discard CD spam
+                if self.is_flood_blocked() and self.flood_seconds_remaining() > 120:
+                    if item.priority >= PRIO_CD:
+                        self._drop("flood_worker", priority=item.priority)
+                        continue
+                await asyncio.sleep(min(remaining, 15.0))
+                if time.time() < max(self._flood_until, self._network_until):
                     await self._queue.put(item)
                     continue
 
@@ -221,17 +259,30 @@ class TelegramOutbox:
                     self._last_flood_log = now_log
                     logger.error(
                         "Telegram flood control: muted for %ss (~%.1fh). "
-                        "Alerts will be dropped until then. "
                         "Or switch BOT_TOKEN to a new bot to unlock sooner.",
                         int(exc.retry_after),
                         float(exc.retry_after) / 3600.0,
                     )
-                if float(exc.retry_after) <= 120 and item.priority <= PRIO_BIG:
-                    await self._queue.put(item)
+                # Re-queue important alerts for short floods
+                if float(exc.retry_after) <= 180 and item.priority <= PRIO_BIG:
+                    item.attempts += 1
+                    if item.attempts <= 3:
+                        await self._queue.put(item)
             except (TelegramNetworkError, asyncio.TimeoutError) as exc:
                 self.note_network_error()
-                logger.warning("Telegram outbox send failed: %s", exc)
-                # Do not re-queue: backoff pause covers the outage; avoids queue blow-up
+                logger.warning(
+                    "Telegram outbox send failed: %s",
+                    exc or type(exc).__name__,
+                )
+                # Retry high-priority a few times after short network backoff
+                if item.priority <= PRIO_RSI:
+                    item.attempts += 1
+                    if item.attempts <= 4:
+                        await self._queue.put(item)
+                    else:
+                        self._drop("net_retries_exhausted", priority=item.priority)
+                else:
+                    self._drop("net_cd", priority=item.priority)
             except Exception as exc:
                 logger.warning("Telegram outbox send failed: %s", exc)
 
@@ -251,7 +302,7 @@ def get_outbox() -> TelegramOutbox:
 def init_outbox(
     *,
     min_interval_sec: float = 1.5,
-    max_queue: int = 80,
+    max_queue: int = 200,
     send_timeout_sec: float = _SEND_TIMEOUT_SEC,
 ) -> TelegramOutbox:
     global _outbox

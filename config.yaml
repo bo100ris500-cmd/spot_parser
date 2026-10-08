@@ -51,7 +51,7 @@ flush_interval_sec: 2
 telegram:
   # Min pause between outbound Telegram messages (anti-flood)
   min_interval_sec: 1.5
-  max_queue: 80
+  max_queue: 200
   # HTTP timeout for Telegram API calls (seconds)
   request_timeout_sec: 35
 
